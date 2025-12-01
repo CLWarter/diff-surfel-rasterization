@@ -317,8 +317,18 @@ renderCUDA(
 				continue;
 
 			T = T / (1.f - alpha);
-			const float dchannel_dcolor = alpha * T;
+
+			// --- NEU: Gleicher Lambert-Faktor wie im Forward ---------------
+			float3 light_dir = make_float3(0.0f, 0.0f, 1.0f);
+			float ndotl = normal[0]*light_dir.x + normal[1]*light_dir.y + normal[2]*light_dir.z;
+			ndotl = fmaxf(ndotl, 0.0f);
+			const float ambient = 0.2f;
+			float shading = ambient + (1.0f - ambient) * ndotl;
+			// ---------------------------------------------------------------
+
+			const float dchannel_dcolor = alpha * T * shading;
 			const float w = alpha * T;
+
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).

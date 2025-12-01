@@ -393,7 +393,17 @@ renderCUDA(
 				continue;
 			}
 
+			// --- NEU: Lambert-Beleuchtung ---------------------------------
+const float3 light_dir = make_float3(0.0f, 0.0f, 1.0f);  // z.B. aus Kamerarichtung
+float ndotl = normal[0]*light_dir.x + normal[1]*light_dir.y + normal[2]*light_dir.z;
+ndotl = fmaxf(ndotl, 0.0f);                              // max(n·l, 0)
+const float ambient = 0.2f;                              // 0..1
+float shading = ambient + (1.0f - ambient) * ndotl;      // S = a + (1-a)*max(...)
+// ---------------------------------------------------------------
+
 			float w = alpha * T;
+			float w_color = w * shading;
+
 #if RENDER_AXUTILITY
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
@@ -415,7 +425,7 @@ renderCUDA(
 
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * w_color;
 			T = test_T;
 
 			// Keep track of last range entry to update this
