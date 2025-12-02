@@ -305,6 +305,18 @@ renderCUDA(
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
 
+			// build n from surfel normal
+			float3 n = make_float3(normal[0], normal[1], normal[2]);
+
+			// normalize n to unit vector
+			float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
+			if (len2_n > 1e-8f) {
+				float inv_n = rsqrtf(len2_n);
+				n.x *= inv_n;
+				n.y *= inv_n;
+				n.z *= inv_n;
+			}
+
 			// accumulations
 
 			float power = -0.5f * rho;
@@ -317,8 +329,30 @@ renderCUDA(
 				continue;
 
 			T = T / (1.f - alpha);
-			const float dchannel_dcolor = alpha * T;
+
+			// --- NEU: Gleicher Lambert-Faktor wie im Forward ---------------
+			float3 light_dir = make_float3(0.0f, 0.0f, 1.0f);
+			float len2_l = light_dir.x*light_dir.x + light_dir.y*light_dir.y + light_dir.z*light_dir.z;
+			if (len2_l > 1e-8f) {
+				float inv_l = rsqrtf(len2_l);
+				light_dir.x *= inv_l;
+				light_dir.y *= inv_l;
+				light_dir.z *= inv_l;
+			}
+
+			float ndotl = n.x*light_dir.x + n.y*light_dir.y + n.z*light_dir.z;
+			ndotl = fmaxf(ndotl, 0.0f);    // clamp to [0,1]
+
+			const float strength = 0.20f;
+			float shading = 1.0f + strength * (ndotl - 0.5f); 
+
+			if (shading < 0.8f) shading = 0.8f;
+			if (shading > 1.2f) shading = 1.2f;
+			// ---------------------------------------------------------------
+
+			const float dchannel_dcolor = alpha * T * shading;
 			const float w = alpha * T;
+
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
@@ -327,16 +361,21 @@ renderCUDA(
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+
+				// same recurrence as before
+				accum_rec[ch] = last_alpha * last_color[ch]
+							+ (1.f - last_alpha) * accum_rec[ch];
 				last_color[ch] = c;
 
 				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+
+				// ✅ NEW: shading factor in alpha grad
+				float contrib = shading * (c - accum_rec[ch]);
+				dL_dalpha += contrib * dL_dchannel;
+
+				// color grad unchanged (already correct)
+				atomicAdd(&(dL_dcolors[global_id * C + ch]),
+						dchannel_dcolor * dL_dchannel);
 			}
 
 			float dL_dz = 0.0f;

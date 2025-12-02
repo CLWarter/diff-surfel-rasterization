@@ -375,6 +375,18 @@ renderCUDA(
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
 
+			// build n from surfel normal
+			float3 n = make_float3(normal[0], normal[1], normal[2]);
+
+			// normalize n to unit vector
+			float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
+			if (len2_n > 1e-8f) {
+				float inv_n = rsqrtf(len2_n);
+				n.x *= inv_n;
+				n.y *= inv_n;
+				n.z *= inv_n;
+			}
+
 			float power = -0.5f * rho;
 			if (power > 0.0f)
 				continue;
@@ -393,7 +405,29 @@ renderCUDA(
 				continue;
 			}
 
+			// --- NEU: Lambert-Beleuchtung ---------------------------------
+			float3 light_dir = make_float3(0.0f, 0.0f, 1.0f);
+			float len2_l = light_dir.x*light_dir.x + light_dir.y*light_dir.y + light_dir.z*light_dir.z;
+			if (len2_l > 1e-8f) {
+				float inv_l = rsqrtf(len2_l);
+				light_dir.x *= inv_l;
+				light_dir.y *= inv_l;
+				light_dir.z *= inv_l;
+			}
+
+			float ndotl = n.x*light_dir.x + n.y*light_dir.y + n.z*light_dir.z;
+			ndotl = fmaxf(ndotl, 0.0f);    // clamp to [0,1]
+
+			const float strength = 0.20f;
+			float shading = 1.0f + strength * (ndotl - 0.5f); 
+
+			if (shading < 0.8f) shading = 0.8f;
+			if (shading > 1.2f) shading = 1.2f;
+			// ---------------------------------------------------------------
+
 			float w = alpha * T;
+			float w_color = w * shading;
+
 #if RENDER_AXUTILITY
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
@@ -415,7 +449,7 @@ renderCUDA(
 
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * w_color;
 			T = test_T;
 
 			// Keep track of last range entry to update this
