@@ -361,16 +361,21 @@ renderCUDA(
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+
+				// same recurrence as before
+				accum_rec[ch] = last_alpha * last_color[ch]
+							+ (1.f - last_alpha) * accum_rec[ch];
 				last_color[ch] = c;
 
 				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+
+				// ✅ NEW: shading factor in alpha grad
+				float contrib = shading * (c - accum_rec[ch]);
+				dL_dalpha += contrib * dL_dchannel;
+
+				// color grad unchanged (already correct)
+				atomicAdd(&(dL_dcolors[global_id * C + ch]),
+						dchannel_dcolor * dL_dchannel);
 			}
 
 			float dL_dz = 0.0f;
