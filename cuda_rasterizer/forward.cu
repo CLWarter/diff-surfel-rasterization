@@ -250,6 +250,28 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
+__device__ __forceinline__
+float3 compute_view_dir(const float3& p_view)
+{
+    // Kamera sitzt im Ursprung (0,0,0) im View-Space
+    // Richtung: von Punkt zur Kamera = -p_view
+    float3 v = make_float3(-p_view.x, -p_view.y, -p_view.z);
+
+    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
+    if (len2 < 1e-20f) {
+        // Degenerationsfall: Punkt quasi an Kamera → irgendeine Default-Richtung
+        return make_float3(0.f, 0.f, 1.f);
+    }
+
+    float inv_len = rsqrtf(len2);
+    v.x *= inv_len;
+    v.y *= inv_len;
+    v.z *= inv_len;
+
+    return v;
+}
+
+
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
@@ -405,22 +427,44 @@ renderCUDA(
 				continue;
 			}
 
-			// abs(cos) shading
-            // simple view/light direction; can later be made per-camera
-            float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
-            float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
+#if ENABLE_LAMBERT_SHADING
+			 float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
+            if (len2_n > 1e-8f) {
+                float inv_n = rsqrtf(len2_n);
+                n.x *= inv_n; n.y *= inv_n; n.z *= inv_n;
+            }
+
+            // light direction – currently fixed to view direction z+
+            float3 light_dir = make_float3(0.0f, 0.0f, 1.0f);
+
+            float len2_l = light_dir.x*light_dir.x +
+                           light_dir.y*light_dir.y +
+                           light_dir.z*light_dir.z;
             if (len2_l > 1e-8f) {
                 float inv_l = rsqrtf(len2_l);
-                view_dir.x *= inv_l;
-                view_dir.y *= inv_l;
-                view_dir.z *= inv_l;
+                light_dir.x *= inv_l;
+                light_dir.y *= inv_l;
+                light_dir.z *= inv_l;
             }
-            float ndotv   = n.x*view_dir.x + n.y*view_dir.y + n.z*view_dir.z;
-            float shading = fabsf(ndotv);   // |cos(theta)|
-			// ------------------------------------------------------------
 
-			float w = alpha * T;
-			float w_color = w * shading;
+            float ndotl = n.x*light_dir.x + n.y*light_dir.y + n.z*light_dir.z;
+
+#  if USE_ABS_COS_SHADING
+            // hemispherical cosine: [-1,1] -> [0,1], symmetric front/back
+            float shading = fabsf(ndotl);
+#  else
+            // classic Lambert: only front-facing contributes
+            float shading = fmaxf(ndotl, 0.0f);
+#  endif
+
+#else
+            // shading disabled – behave like original 2DGS
+            float shading = 1.0f;
+#endif
+            // ---------------------------------------------------------------
+
+            float w       = alpha * T;
+            float w_color = w * shading;
 
 #if RENDER_AXUTILITY
 			// Render depth distortion map

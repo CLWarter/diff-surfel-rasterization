@@ -138,6 +138,27 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
+__device__ __forceinline__
+float3 compute_view_dir(const float3& p_view)
+{
+    // Kamera sitzt im Ursprung (0,0,0) im View-Space
+    // Richtung: von Punkt zur Kamera = -p_view
+    float3 v = make_float3(-p_view.x, -p_view.y, -p_view.z);
+
+    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
+    if (len2 < 1e-20f) {
+        // Degenerationsfall: Punkt quasi an Kamera → irgendeine Default-Richtung
+        return make_float3(0.f, 0.f, 1.f);
+    }
+
+    float inv_len = rsqrtf(len2);
+    v.x *= inv_len;
+    v.y *= inv_len;
+    v.z *= inv_len;
+
+    return v;
+}
+
 
 // Backward version of the rendering procedure.
 template <uint32_t C>
@@ -330,7 +351,6 @@ renderCUDA(
 
 			T = T / (1.f - alpha);
 
-			// abs(cos) shading
             float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
             float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
             if (len2_l > 1e-8f) {
@@ -339,59 +359,97 @@ renderCUDA(
                 view_dir.y *= inv_l;
                 view_dir.z *= inv_l;
             }
-            float ndotv   = n.x*view_dir.x + n.y*view_dir.y + n.z*view_dir.z;
-            float shading = fabsf(ndotv);   // |cos(theta)|
+		   	// float3 view_dir = compute_view_dir(p_view);
+			float ndotv = n.x * view_dir.x
+						+ n.y * view_dir.y
+						+ n.z * view_dir.z;
+#if USE_ABS_COS_SHADING
+            // Variante B: Hemisphärisch |cos|
+            float shading = fabsf(ndotv);
+#else
+            // Variante A: klassisches Lambert max(dot,0)
+            float shading = fmaxf(ndotv, 0.0f);
+#endif
 			// ----------------------------------------------------------
 
-			const float w = alpha * T;
-			const float dchannel_dcolor = w * shading;
+            const float w = alpha * T;
+            const float dchannel_dcolor = w * shading;
 
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
-  			float dL_dalpha   = 0.0f;
-            float dL_dshading = 0.0f;  // for normal gradient via |cos|
+            // Propagate gradients to per-Gaussian colors and keep
+            // gradients w.r.t. alpha (blending factor for a Gaussian/pixel pair).
+            float dL_dalpha = 0.0f;
+
+#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
+            float dL_dshading = 0.0f;  // for normal gradient via cos term
+#endif
 
             const int global_id = collected_id[j];
 
-			for (int ch = 0; ch < C; ch++)
-			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];
+            for (int ch = 0; ch < C; ch++)
+            {
+                const float c = collected_colors[ch * BLOCK_SIZE + j];
 
-				// same recurrence as before
-				accum_rec[ch] = last_alpha * last_color[ch]
-							+ (1.f - last_alpha) * accum_rec[ch];
-				last_color[ch] = c;
+                // same recurrence as before
+                accum_rec[ch] = last_alpha * last_color[ch]
+                              + (1.f - last_alpha) * accum_rec[ch];
+                last_color[ch] = c;
 
-				const float dL_dchannel = dL_dpixel[ch];
+                const float dL_dchannel = dL_dpixel[ch];
 
-				// ✅ NEW: shading factor in alpha grad
-				float contrib = shading * (c - accum_rec[ch]);
-				dL_dalpha += contrib * dL_dchannel;
+                // shading factor appears in alpha gradient
+                float contrib = shading * (c - accum_rec[ch]);
+                dL_dalpha += contrib * dL_dchannel;
 
-				// shading gradient: dI_ch/ds = w * c
+#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
+                // dI_ch/ds = w * c  → accumulate dL/ds
                 dL_dshading += dL_dchannel * w * c;
+#endif
 
-				// color grad unchanged (already correct)
-				atomicAdd(&(dL_dcolors[global_id * C + ch]),
-						dchannel_dcolor * dL_dchannel);
-			}
-
-			  // gradient wrt shading → wrt normal (ignoring normalization)
-            if (dL_dshading != 0.0f) {
-                float sign = (ndotv >= 0.0f) ? 1.0f : -1.0f;
-                float3 dL_dn = {
-                    dL_dshading * sign * view_dir.x,
-                    dL_dshading * sign * view_dir.y,
-                    dL_dshading * sign * view_dir.z
-                };
-                atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dn.x);
-                atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dn.y);
-                atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dn.z);
+                // color grad unchanged
+                atomicAdd(&(dL_dcolors[global_id * C + ch]),
+                          dchannel_dcolor * dL_dchannel);
             }
 
-			float dL_dz = 0.0f;
-			float dL_dweight = 0;
+#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
+            // Gradient wrt shading scalar → wrt ndot(view_dir)
+            if (dL_dshading != 0.0f) {
+                float dL_dndotv = 0.0f;
+
+#  if USE_ABS_COS_SHADING
+                // shading = |ndotv|
+                if (ndotv > 0.0f) {
+                    dL_dndotv = dL_dshading;    // +1
+                } else if (ndotv < 0.0f) {
+                    dL_dndotv = -dL_dshading;   // -1
+                } else {
+                    dL_dndotv = 0.0f;           // kink at 0
+                }
+#  else
+                // shading = max(ndotv, 0)
+                if (ndotv > 0.0f) {
+                    dL_dndotv = dL_dshading;    // d/dx (x) = 1
+                } else {
+                    dL_dndotv = 0.0f;           // no grad if back-facing
+                }
+#  endif
+
+                if (dL_dndotv != 0.0f) {
+                    // ndotv = dot(n, view_dir) → dL/dn = dL/dndotv * view_dir
+                    float3 dL_dn = {
+                        dL_dndotv * view_dir.x,
+                        dL_dndotv * view_dir.y,
+                        dL_dndotv * view_dir.z
+                    };
+                    atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dn.x);
+                    atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dn.y);
+                    atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dn.z);
+                }
+            }
+#endif
+
+            float dL_dz      = 0.0f;
+            float dL_dweight = 0;
+
 #if RENDER_AXUTILITY
 			const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
 			const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * c_d * c_d);
