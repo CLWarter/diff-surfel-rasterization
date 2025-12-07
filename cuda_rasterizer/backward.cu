@@ -330,34 +330,30 @@ renderCUDA(
 
 			T = T / (1.f - alpha);
 
-			// --- NEU: Gleicher Lambert-Faktor wie im Forward ---------------
-			float3 light_dir = make_float3(0.0f, 0.0f, 1.0f);
-			float len2_l = light_dir.x*light_dir.x + light_dir.y*light_dir.y + light_dir.z*light_dir.z;
-			if (len2_l > 1e-8f) {
-				float inv_l = rsqrtf(len2_l);
-				light_dir.x *= inv_l;
-				light_dir.y *= inv_l;
-				light_dir.z *= inv_l;
-			}
+			// abs(cos) shading
+            float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
+            float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
+            if (len2_l > 1e-8f) {
+                float inv_l = rsqrtf(len2_l);
+                view_dir.x *= inv_l;
+                view_dir.y *= inv_l;
+                view_dir.z *= inv_l;
+            }
+            float ndotv   = n.x*view_dir.x + n.y*view_dir.y + n.z*view_dir.z;
+            float shading = fabsf(ndotv);   // |cos(theta)|
+			// ----------------------------------------------------------
 
-			float ndotl = n.x*light_dir.x + n.y*light_dir.y + n.z*light_dir.z;
-			ndotl = fmaxf(ndotl, 0.0f);    // clamp to [0,1]
-
-			const float strength = 0.20f;
-			float shading = 1.0f + strength * (ndotl - 0.5f); 
-
-			if (shading < 0.8f) shading = 0.8f;
-			if (shading > 1.2f) shading = 1.2f;
-			// ---------------------------------------------------------------
-
-			const float dchannel_dcolor = alpha * T * shading;
 			const float w = alpha * T;
+			const float dchannel_dcolor = w * shading;
 
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
-			float dL_dalpha = 0.0f;
-			const int global_id = collected_id[j];
+  			float dL_dalpha   = 0.0f;
+            float dL_dshading = 0.0f;  // for normal gradient via |cos|
+
+            const int global_id = collected_id[j];
+
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
@@ -373,10 +369,26 @@ renderCUDA(
 				float contrib = shading * (c - accum_rec[ch]);
 				dL_dalpha += contrib * dL_dchannel;
 
+				// shading gradient: dI_ch/ds = w * c
+                dL_dshading += dL_dchannel * w * c;
+
 				// color grad unchanged (already correct)
 				atomicAdd(&(dL_dcolors[global_id * C + ch]),
 						dchannel_dcolor * dL_dchannel);
 			}
+
+			  // gradient wrt shading → wrt normal (ignoring normalization)
+            if (dL_dshading != 0.0f) {
+                float sign = (ndotv >= 0.0f) ? 1.0f : -1.0f;
+                float3 dL_dn = {
+                    dL_dshading * sign * view_dir.x,
+                    dL_dshading * sign * view_dir.y,
+                    dL_dshading * sign * view_dir.z
+                };
+                atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dn.x);
+                atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dn.y);
+                atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dn.z);
+            }
 
 			float dL_dz = 0.0f;
 			float dL_dweight = 0;

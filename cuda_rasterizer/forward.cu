@@ -405,25 +405,19 @@ renderCUDA(
 				continue;
 			}
 
-			// --- NEU: Lambert-Beleuchtung ---------------------------------
-			float3 light_dir = make_float3(0.0f, 0.0f, 1.0f);
-			float len2_l = light_dir.x*light_dir.x + light_dir.y*light_dir.y + light_dir.z*light_dir.z;
-			if (len2_l > 1e-8f) {
-				float inv_l = rsqrtf(len2_l);
-				light_dir.x *= inv_l;
-				light_dir.y *= inv_l;
-				light_dir.z *= inv_l;
-			}
-
-			float ndotl = n.x*light_dir.x + n.y*light_dir.y + n.z*light_dir.z;
-			ndotl = fmaxf(ndotl, 0.0f);    // clamp to [0,1]
-
-			const float strength = 0.20f;
-			float shading = 1.0f + strength * (ndotl - 0.5f); 
-
-			if (shading < 0.8f) shading = 0.8f;
-			if (shading > 1.2f) shading = 1.2f;
-			// ---------------------------------------------------------------
+			// abs(cos) shading
+            // simple view/light direction; can later be made per-camera
+            float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
+            float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
+            if (len2_l > 1e-8f) {
+                float inv_l = rsqrtf(len2_l);
+                view_dir.x *= inv_l;
+                view_dir.y *= inv_l;
+                view_dir.z *= inv_l;
+            }
+            float ndotv   = n.x*view_dir.x + n.y*view_dir.y + n.z*view_dir.z;
+            float shading = fabsf(ndotv);   // |cos(theta)|
+			// ------------------------------------------------------------
 
 			float w = alpha * T;
 			float w_color = w * shading;
