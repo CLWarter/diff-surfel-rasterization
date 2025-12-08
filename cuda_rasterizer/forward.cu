@@ -251,23 +251,21 @@ __global__ void preprocessCUDA(int P, int D, int M,
 }
 
 __device__ __forceinline__
-float3 compute_view_dir(const float3& p_view)
+float3 compute_view_dir(const float2& pixf,
+                                   int W, int H,
+                                   float focal_x, float focal_y)
 {
-    // Kamera sitzt im Ursprung (0,0,0) im View-Space
-    // Richtung: von Punkt zur Kamera = -p_view
-    float3 v = make_float3(-p_view.x, -p_view.y, -p_view.z);
+    float x = (pixf.x - 0.5f * (float)W) / focal_x;
+    float y = (pixf.y - 0.5f * (float)H) / focal_y;
+    float3 v = make_float3(x, y, 1.0f);
 
     float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
-    if (len2 < 1e-20f) {
-        // Degenerationsfall: Punkt quasi an Kamera → irgendeine Default-Richtung
-        return make_float3(0.f, 0.f, 1.f);
-    }
+    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 1.f);
 
     float inv_len = rsqrtf(len2);
     v.x *= inv_len;
     v.y *= inv_len;
     v.z *= inv_len;
-
     return v;
 }
 
@@ -306,6 +304,11 @@ renderCUDA(
 	bool inside = pix.x < W&& pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
+
+	// Precompute per-pixel view direction (for Lambert shading)
+#if ENABLE_LAMBERT_SHADING
+    float3 light_dir = compute_view_dir(pixf, W, H, focal_x, focal_y);
+#endif
 
 	// Load start/end range of IDs to process in bit sorted list.
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -397,18 +400,6 @@ renderCUDA(
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
 
-			// build n from surfel normal
-			float3 n = make_float3(normal[0], normal[1], normal[2]);
-
-			// normalize n to unit vector
-			float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
-			if (len2_n > 1e-8f) {
-				float inv_n = rsqrtf(len2_n);
-				n.x *= inv_n;
-				n.y *= inv_n;
-				n.z *= inv_n;
-			}
-
 			float power = -0.5f * rho;
 			if (power > 0.0f)
 				continue;
@@ -428,25 +419,26 @@ renderCUDA(
 			}
 
 #if ENABLE_LAMBERT_SHADING
-			 float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
+			// build n from surfel normal
+			float3 n = make_float3(normal[0], normal[1], normal[2]);
+
+			// normalize n to unit vector
+			float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
             if (len2_n > 1e-8f) {
                 float inv_n = rsqrtf(len2_n);
-                n.x *= inv_n; n.y *= inv_n; n.z *= inv_n;
+                n.x *= inv_n;
+				n.y *= inv_n;
+				n.z *= inv_n;
             }
 
-            // light direction – currently fixed to view direction z+
-            float3 light_dir = make_float3(0.0f, 0.0f, 1.0f);
-
-            float len2_l = light_dir.x*light_dir.x +
-                           light_dir.y*light_dir.y +
-                           light_dir.z*light_dir.z;
+            /*float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
+            float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
             if (len2_l > 1e-8f) {
                 float inv_l = rsqrtf(len2_l);
-                light_dir.x *= inv_l;
-                light_dir.y *= inv_l;
-                light_dir.z *= inv_l;
-            }
-
+                view_dir.x *= inv_l;
+                view_dir.y *= inv_l;
+                view_dir.z *= inv_l;
+            }*/
             float ndotl = n.x*light_dir.x + n.y*light_dir.y + n.z*light_dir.z;
 
 #  if USE_ABS_COS_SHADING

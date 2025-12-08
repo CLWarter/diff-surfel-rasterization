@@ -21,11 +21,10 @@
 #define TIGHTBBOX 0
 #define RENDER_AXUTILITY 1
 
-// === Shading controls ===
-#define ENABLE_LAMBERT_SHADING   1   // 0 = no shading, 1 = Lambert term in forward/backward
-#define ENABLE_LAMBERT_NORMAL_GRAD 1 // 0 = don't backprop into normals from shading
-
-#define USE_ABS_COS_SHADING 1 // 1 for ABS, 0 for max(cos, 0)
+// === NEW controls ===
+#define ENABLE_LAMBERT_SHADING   0   // 0 = no shading, 1 = Lambert term in forward/backward
+#define ENABLE_LAMBERT_NORMAL_GRAD 0 // 0 = don't backprop into normals from shading
+#define USE_ABS_COS_SHADING 0 // 1 for ABS, 0 for max(cos, 0)
 
 #define DEPTH_OFFSET 0
 #define ALPHA_OFFSET 1

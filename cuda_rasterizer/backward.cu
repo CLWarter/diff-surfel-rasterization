@@ -139,23 +139,21 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 }
 
 __device__ __forceinline__
-float3 compute_view_dir(const float3& p_view)
+float3 compute_view_dir(const float2& pixf,
+                                   int W, int H,
+                                   float focal_x, float focal_y)
 {
-    // Kamera sitzt im Ursprung (0,0,0) im View-Space
-    // Richtung: von Punkt zur Kamera = -p_view
-    float3 v = make_float3(-p_view.x, -p_view.y, -p_view.z);
+    float x = (pixf.x - 0.5f * (float)W) / focal_x;
+    float y = (pixf.y - 0.5f * (float)H) / focal_y;
+    float3 v = make_float3(x, y, 1.0f);
 
     float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
-    if (len2 < 1e-20f) {
-        // Degenerationsfall: Punkt quasi an Kamera → irgendeine Default-Richtung
-        return make_float3(0.f, 0.f, 1.f);
-    }
+    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 1.f);
 
     float inv_len = rsqrtf(len2);
     v.x *= inv_len;
     v.y *= inv_len;
     v.z *= inv_len;
-
     return v;
 }
 
@@ -351,15 +349,16 @@ renderCUDA(
 
 			T = T / (1.f - alpha);
 
-            float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
+#if ENABLE_LAMBERT_SHADING
+            /*float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
             float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
             if (len2_l > 1e-8f) {
                 float inv_l = rsqrtf(len2_l);
                 view_dir.x *= inv_l;
                 view_dir.y *= inv_l;
                 view_dir.z *= inv_l;
-            }
-		   	// float3 view_dir = compute_view_dir(p_view);
+            }*/
+		   	float3 view_dir = compute_view_dir(pixf, W, H, focal_x, focal_y);
 			float ndotv = n.x * view_dir.x
 						+ n.y * view_dir.y
 						+ n.z * view_dir.z;
@@ -369,6 +368,11 @@ renderCUDA(
 #else
             // Variante A: klassisches Lambert max(dot,0)
             float shading = fmaxf(ndotv, 0.0f);
+#endif
+
+#else
+            // shading disabled – behave like original 2DGS
+            float shading = 1.0f;
 #endif
 			// ----------------------------------------------------------
 
@@ -405,7 +409,6 @@ renderCUDA(
                 dL_dshading += dL_dchannel * w * c;
 #endif
 
-                // color grad unchanged
                 atomicAdd(&(dL_dcolors[global_id * C + ch]),
                           dchannel_dcolor * dL_dchannel);
             }
@@ -435,11 +438,11 @@ renderCUDA(
 
                 if (dL_dndotv != 0.0f) {
                     // ndotv = dot(n, view_dir) → dL/dn = dL/dndotv * view_dir
-                    float3 dL_dn = {
+                    float3 dL_dn = make_float3(
                         dL_dndotv * view_dir.x,
                         dL_dndotv * view_dir.y,
                         dL_dndotv * view_dir.z
-                    };
+					);
                     atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dn.x);
                     atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dn.y);
                     atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dn.z);
