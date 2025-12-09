@@ -251,7 +251,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 }
 
 __device__ __forceinline__
-float3 compute_view_dir(const float2& pixf,
+float3 compute_light_dir(const float2& pixf,
                                    int W, int H,
                                    float focal_x, float focal_y)
 {
@@ -304,11 +304,6 @@ renderCUDA(
 	bool inside = pix.x < W&& pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
-
-	// Precompute per-pixel view direction (for Lambert shading)
-#if ENABLE_LAMBERT_SHADING
-    float3 light_dir = compute_view_dir(pixf, W, H, focal_x, focal_y);
-#endif
 
 	// Load start/end range of IDs to process in bit sorted list.
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -439,6 +434,10 @@ renderCUDA(
                 view_dir.y *= inv_l;
                 view_dir.z *= inv_l;
             }*/
+		   	float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
+			light_dir.x = -light_dir.x;
+			light_dir.y = -light_dir.y;
+			light_dir.z = -light_dir.z;
             float ndotl = n.x*light_dir.x + n.y*light_dir.y + n.z*light_dir.z;
 
 #  if USE_ABS_COS_SHADING

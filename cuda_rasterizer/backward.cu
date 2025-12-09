@@ -139,7 +139,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 }
 
 __device__ __forceinline__
-float3 compute_view_dir(const float2& pixf,
+float3 compute_light_dir(const float2& pixf,
                                    int W, int H,
                                    float focal_x, float focal_y)
 {
@@ -324,18 +324,6 @@ renderCUDA(
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
 
-			// build n from surfel normal
-			float3 n = make_float3(normal[0], normal[1], normal[2]);
-
-			// normalize n to unit vector
-			float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
-			if (len2_n > 1e-8f) {
-				float inv_n = rsqrtf(len2_n);
-				n.x *= inv_n;
-				n.y *= inv_n;
-				n.z *= inv_n;
-			}
-
 			// accumulations
 
 			float power = -0.5f * rho;
@@ -350,6 +338,18 @@ renderCUDA(
 			T = T / (1.f - alpha);
 
 #if ENABLE_LAMBERT_SHADING
+			// build n from surfel normal
+			float3 n = make_float3(normal[0], normal[1], normal[2]);
+
+			// normalize n to unit vector
+			float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
+			if (len2_n > 1e-8f) {
+				float inv_n = rsqrtf(len2_n);
+				n.x *= inv_n;
+				n.y *= inv_n;
+				n.z *= inv_n;
+			}
+
             /*float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
             float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
             if (len2_l > 1e-8f) {
@@ -358,10 +358,13 @@ renderCUDA(
                 view_dir.y *= inv_l;
                 view_dir.z *= inv_l;
             }*/
-		   	float3 view_dir = compute_view_dir(pixf, W, H, focal_x, focal_y);
-			float ndotv = n.x * view_dir.x
-						+ n.y * view_dir.y
-						+ n.z * view_dir.z;
+		   	float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
+			light_dir.x = -light_dir.x;
+			light_dir.y = -light_dir.y;
+			light_dir.z = -light_dir.z;
+			float ndotv = n.x * light_dir.x
+						+ n.y * light_dir.y
+						+ n.z * light_dir.z;
 #if USE_ABS_COS_SHADING
             // Variante B: Hemisphärisch |cos|
             float shading = fabsf(ndotv);
@@ -439,9 +442,9 @@ renderCUDA(
                 if (dL_dndotv != 0.0f) {
                     // ndotv = dot(n, view_dir) → dL/dn = dL/dndotv * view_dir
                     float3 dL_dn = make_float3(
-                        dL_dndotv * view_dir.x,
-                        dL_dndotv * view_dir.y,
-                        dL_dndotv * view_dir.z
+                        dL_dndotv * light_dir.x,
+                        dL_dndotv * light_dir.y,
+                        dL_dndotv * light_dir.z
 					);
                     atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dn.x);
                     atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dn.y);
