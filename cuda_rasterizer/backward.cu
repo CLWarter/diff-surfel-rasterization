@@ -337,12 +337,20 @@ renderCUDA(
 
 			T = T / (1.f - alpha);
 
-#if ENABLE_LAMBERT_SHADING
+			
+		// ========== LAMBERT + PHONG SHADING (BACKWARD) ============================
+		float shading;
+		float lambert = 1.0f;
+		float specular = 0.0f;
+		float3 light_dir;
+		float ndotl = 0.0f;
+
+		#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
 			// build n from surfel normal
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 
-			// normalize n to unit vector
-			float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
+			// normalize n
+			float len2_n = n.x * n.x + n.y * n.y + n.z * n.z;
 			if (len2_n > 1e-8f) {
 				float inv_n = rsqrtf(len2_n);
 				n.x *= inv_n;
@@ -350,108 +358,156 @@ renderCUDA(
 				n.z *= inv_n;
 			}
 
-            /*float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
-            float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
-            if (len2_l > 1e-8f) {
-                float inv_l = rsqrtf(len2_l);
-                view_dir.x *= inv_l;
-                view_dir.y *= inv_l;
-                view_dir.z *= inv_l;
-            }*/
-		   	float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
+			// flashlight at/near camera: direction from camera to pixel (view ray)
+			/*light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
 			light_dir.x = -light_dir.x;
 			light_dir.y = -light_dir.y;
-			light_dir.z = -light_dir.z;
-			float ndotv = n.x * light_dir.x
-						+ n.y * light_dir.y
-						+ n.z * light_dir.z;
-#if USE_ABS_COS_SHADING
-            // Variante B: Hemisphärisch |cos|
-            float shading = fabsf(ndotv);
-#else
-            // Variante A: klassisches Lambert max(dot,0)
-            float shading = fmaxf(ndotv, 0.0f);
-#endif
+			light_dir.z = -light_dir.z;*/
+			// Direction from Surface TO Light
+			/*ndotl = n.x * light_dir.x
+				+ n.y * light_dir.y
+				+ n.z * light_dir.z;*/
+			float3 cam_forward_world = make_float3(
+				viewmatrix[2],
+				viewmatrix[6],
+				viewmatrix[10]
+			);
 
-#else
-            // shading disabled – behave like original 2DGS
-            float shading = 1.0f;
-#endif
-			// ----------------------------------------------------------
+			float len2 = cam_forward_world.x * cam_forward_world.x +
+						cam_forward_world.y * cam_forward_world.y +
+						cam_forward_world.z * cam_forward_world.z;
 
-            const float w = alpha * T;
-            const float dchannel_dcolor = w * shading;
+			if (len2 > 1e-12f) {
+				float inv_len = rsqrtf(len2);
+				cam_forward_world.x *= inv_len;
+				cam_forward_world.y *= inv_len;
+				cam_forward_world.z *= inv_len;
+			} else {
+				cam_forward_world = make_float3(0,0,1);
+			}
 
-            // Propagate gradients to per-Gaussian colors and keep
-            // gradients w.r.t. alpha (blending factor for a Gaussian/pixel pair).
-            float dL_dalpha = 0.0f;
+			light_dir = cam_forward_world;
+			ndotl = n.x * light_dir.x
+				+ n.y * light_dir.y
+				+ n.z * light_dir.z;
 
-#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
-            float dL_dshading = 0.0f;  // for normal gradient via cos term
-#endif
+			// --- Lambert diffuse ---------------------------------------------------
+		#   if ENABLE_LAMBERT_SHADING
+		#       if USE_ABS_COS_SHADING
+					lambert = fabsf(ndotl);
+		#       else
+					lambert = fmaxf(ndotl, 0.0f);
+		#       endif
+		#   else
+				lambert = 1.0f;
+		#   endif
 
-            const int global_id = collected_id[j];
+			// --- Phong specular ----------------------------------------------------
+		#   if ENABLE_PHONG_SPECULAR
+				float ndotl_clamped = fmaxf(ndotl, 0.0f);
+				if (ndotl_clamped > 0.0f) {
+					specular = powf(ndotl_clamped, PHONG_SHININESS);
+				} else {
+					specular = 0.0f;
+				}
+		#   endif
 
-            for (int ch = 0; ch < C; ch++)
-            {
-                const float c = collected_colors[ch * BLOCK_SIZE + j];
+		#else
+			lambert  = 1.0f;
+			specular = 0.0f;
+			light_dir = make_float3(0.0f, 0.0f, 1.0f);
+			ndotl    = 0.0f;
+		#endif
 
-                // same recurrence as before
-                accum_rec[ch] = last_alpha * last_color[ch]
-                              + (1.f - last_alpha) * accum_rec[ch];
-                last_color[ch] = c;
+		// Combined shading exactly as in forward
+		shading = lambert
+		#if ENABLE_PHONG_SPECULAR
+				+ PHONG_KS * specular
+		#endif
+				;
 
-                const float dL_dchannel = dL_dpixel[ch];
+		const float w = alpha * T;
+		const float dchannel_dcolor = w * shading;
 
-                // shading factor appears in alpha gradient
-                float contrib = shading * (c - accum_rec[ch]);
-                dL_dalpha += contrib * dL_dchannel;
+		// gradients w.r.t alpha
+		float dL_dalpha = 0.0f;
 
-#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
-                // dI_ch/ds = w * c  → accumulate dL/ds
-                dL_dshading += dL_dchannel * w * c;
-#endif
+		// accumulate dL/d(shading) if any normal grads are enabled
+		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
+			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
+			float dL_dshading = 0.0f;
+		#endif
 
-                atomicAdd(&(dL_dcolors[global_id * C + ch]),
-                          dchannel_dcolor * dL_dchannel);
-            }
+		const int global_id = collected_id[j];
 
-#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
-            // Gradient wrt shading scalar → wrt ndot(view_dir)
-            if (dL_dshading != 0.0f) {
-                float dL_dndotv = 0.0f;
+		for (int ch = 0; ch < C; ch++)
+		{
+			const float c = collected_colors[ch * BLOCK_SIZE + j];
 
-#  if USE_ABS_COS_SHADING
-                // shading = |ndotv|
-                if (ndotv > 0.0f) {
-                    dL_dndotv = dL_dshading;    // +1
-                } else if (ndotv < 0.0f) {
-                    dL_dndotv = -dL_dshading;   // -1
-                } else {
-                    dL_dndotv = 0.0f;           // kink at 0
-                }
-#  else
-                // shading = max(ndotv, 0)
-                if (ndotv > 0.0f) {
-                    dL_dndotv = dL_dshading;    // d/dx (x) = 1
-                } else {
-                    dL_dndotv = 0.0f;           // no grad if back-facing
-                }
-#  endif
+			// same recurrence as before
+			accum_rec[ch] = last_alpha * last_color[ch]
+						+ (1.f - last_alpha) * accum_rec[ch];
+			last_color[ch] = c;
 
-                if (dL_dndotv != 0.0f) {
-                    // ndotv = dot(n, view_dir) → dL/dn = dL/dndotv * view_dir
-                    float3 dL_dn = make_float3(
-                        dL_dndotv * light_dir.x,
-                        dL_dndotv * light_dir.y,
-                        dL_dndotv * light_dir.z
-					);
-                    atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dn.x);
-                    atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dn.y);
-                    atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dn.z);
-                }
-            }
-#endif
+			const float dL_dchannel = dL_dpixel[ch];
+
+			// shading factor appears in alpha gradient
+			float contrib = shading * (c - accum_rec[ch]);
+			dL_dalpha += contrib * dL_dchannel;
+
+		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
+			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
+			// I_ch += w * shading * c  ⇒ ∂I/∂shading = w * c
+			dL_dshading += dL_dchannel * w * c;
+		#endif
+
+			// ∂I/∂c = w * shading
+			atomicAdd(&(dL_dcolors[global_id * C + ch]),
+					dchannel_dcolor * dL_dchannel);
+		}
+
+		// ---------- Normal gradient from Lambert + Phong --------------------------
+		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
+			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
+		if (dL_dshading != 0.0f) {
+			float dL_dndotl = 0.0f;
+
+			// d(shading)/d(ndotl) = d(lambert)/d(ndotl) + PHONG_KS * d(spec)/d(ndotl)
+			// 1) Lambert part
+		#   if ENABLE_LAMBERT_SHADING && !USE_ABS_COS_SHADING
+				if (ndotl > 0.0f) {
+					dL_dndotl += dL_dshading; // lambert = max(ndotl,0) ⇒ derivative 1 for ndotl>0
+				}
+		#   elif ENABLE_LAMBERT_SHADING && USE_ABS_COS_SHADING
+				if (ndotl > 0.0f)       dL_dndotl += dL_dshading;   // +1
+				else if (ndotl < 0.0f)  dL_dndotl -= dL_dshading;   // -1
+		#   endif
+
+			// 2) Phong specular part (specular = max(ndotl,0)^shininess)
+		#   if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
+				if (ndotl > 0.0f) {
+					float ndotl_clamped = ndotl; // > 0 guaranteed here
+					float spec_deriv = PHONG_SHININESS
+									* powf(ndotl_clamped, PHONG_SHININESS - 1.0f);
+					dL_dndotl += dL_dshading * PHONG_KS * spec_deriv;
+				}
+		#   endif
+
+			if (dL_dndotl != 0.0f) {
+				// ndotl = dot(n, light_dir) ⇒ dL/dn = dL/dndotl * light_dir
+				float3 dL_dn = make_float3(
+					dL_dndotl * light_dir.x,
+					dL_dndotl * light_dir.y,
+					dL_dndotl * light_dir.z
+				);
+
+				atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dn.x);
+				atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dn.y);
+				atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dn.z);
+			}
+		}
+		#endif
+		// ========== END LAMBERT + PHONG SHADING (BACKWARD) ========================
 
             float dL_dz      = 0.0f;
             float dL_dweight = 0;

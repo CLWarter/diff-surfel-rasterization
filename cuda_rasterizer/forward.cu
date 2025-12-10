@@ -412,46 +412,96 @@ renderCUDA(
 				done = true;
 				continue;
 			}
+		// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
+		float shading;        // final shading multiplier
+		float lambert = 1.0f; // diffuse part
+		float specular = 0.0f;
+		float3 light_dir;
+		float ndotl = 0.0f;
 
-#if ENABLE_LAMBERT_SHADING
-			// build n from surfel normal
+		#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
+			// surfel normal
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 
-			// normalize n to unit vector
-			float len2_n = n.x*n.x + n.y*n.y + n.z*n.z;
-            if (len2_n > 1e-8f) {
-                float inv_n = rsqrtf(len2_n);
-                n.x *= inv_n;
+			// normalize n
+			float len2_n = n.x * n.x + n.y * n.y + n.z * n.z;
+			if (len2_n > 1e-8f) {
+				float inv_n = rsqrtf(len2_n);
+				n.x *= inv_n;
 				n.y *= inv_n;
 				n.z *= inv_n;
-            }
+			}
 
-            /*float3 view_dir = make_float3(0.0f, 0.0f, 1.0f);
-            float len2_l = view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z;
-            if (len2_l > 1e-8f) {
-                float inv_l = rsqrtf(len2_l);
-                view_dir.x *= inv_l;
-                view_dir.y *= inv_l;
-                view_dir.z *= inv_l;
-            }*/
-		   	float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
+			// flashlight at/near camera: direction from camera to pixel (view ray)
+			/*light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
 			light_dir.x = -light_dir.x;
 			light_dir.y = -light_dir.y;
-			light_dir.z = -light_dir.z;
-            float ndotl = n.x*light_dir.x + n.y*light_dir.y + n.z*light_dir.z;
+			light_dir.z = -light_dir.z;*/
+			// Direction from Surface TO Light
+			/*ndotl = n.x * light_dir.x
+				+ n.y * light_dir.y
+				+ n.z * light_dir.z;*/
+			float3 cam_forward_world = make_float3(
+				viewmatrix[2],
+				viewmatrix[6],
+				viewmatrix[10]
+			);
 
-#  if USE_ABS_COS_SHADING
-            // hemispherical cosine: [-1,1] -> [0,1], symmetric front/back
-            float shading = fabsf(ndotl);
-#  else
-            // classic Lambert: only front-facing contributes
-            float shading = fmaxf(ndotl, 0.0f);
-#  endif
+			float len2 = cam_forward_world.x * cam_forward_world.x +
+						cam_forward_world.y * cam_forward_world.y +
+						cam_forward_world.z * cam_forward_world.z;
 
-#else
-            // shading disabled – behave like original 2DGS
-            float shading = 1.0f;
-#endif
+			if (len2 > 1e-12f) {
+				float inv_len = rsqrtf(len2);
+				cam_forward_world.x *= inv_len;
+				cam_forward_world.y *= inv_len;
+				cam_forward_world.z *= inv_len;
+			} else {
+				cam_forward_world = make_float3(0,0,1);
+			}
+
+			light_dir = cam_forward_world;
+			ndotl = n.x * light_dir.x
+				+ n.y * light_dir.y
+				+ n.z * light_dir.z;
+
+			// --- Lambert diffuse ---------------------------------------------------
+		#   if ENABLE_LAMBERT_SHADING
+		#       if USE_ABS_COS_SHADING
+					lambert = fabsf(ndotl);
+		#       else
+					lambert = fmaxf(ndotl, 0.0f);
+		#       endif
+		#   else
+				lambert = 1.0f;    // if Lambert disabled but Phong enabled
+		#   endif
+
+			// --- Phong/Blinn-like specular ----------------------------------------
+		#   if ENABLE_PHONG_SPECULAR
+				// For camera-mounted flashlight, view_dir ≈ light_dir
+				float ndotl_clamped = fmaxf(ndotl, 0.0f);
+				if (ndotl_clamped > 0.0f) {
+					// Simple Phong: spec = (n·l)^shininess
+					specular = powf(ndotl_clamped, PHONG_SHININESS);
+				} else {
+					specular = 0.0f;
+				}
+		#   endif
+
+		#else
+			// No Lambert and no Phong: pure 2DGS
+			lambert  = 1.0f;
+			specular = 0.0f;
+			light_dir = make_float3(0.0f, 0.0f, 1.0f);
+			ndotl    = 0.0f;
+		#endif
+
+		// Combine terms: diffuse + ks * spec
+		shading = lambert;
+		#if ENABLE_PHONG_SPECULAR
+				+ PHONG_KS * specular
+		#endif
+		;
             // ---------------------------------------------------------------
 
             float w       = alpha * T;

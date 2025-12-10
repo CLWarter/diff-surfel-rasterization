@@ -23,7 +23,14 @@
 
 // === NEW controls ===
 #define ENABLE_LAMBERT_SHADING   1   // 0 = no shading, 1 = Lambert term in forward/backward
-#define ENABLE_LAMBERT_NORMAL_GRAD 0 // 0 = don't backprop into normals from shading
+#define ENABLE_LAMBERT_NORMAL_GRAD 1 // 0 = don't backprop into normals from shading
+#define ENABLE_PHONG_SPECULAR 1
+#define ENABLE_PHONG_NORMAL_GRAD 1
+
+// Simple Blinn-Phong-like parameters
+#define PHONG_SHININESS             8.0f   // exponent, tune as you like // was 16
+#define PHONG_KS                    0.1f    // specular strength (relative to diffuse=1) // was 0.3
+
 #define USE_ABS_COS_SHADING 0 // 1 for ABS, 0 for max(cos, 0)
 
 #define DEPTH_OFFSET 0
