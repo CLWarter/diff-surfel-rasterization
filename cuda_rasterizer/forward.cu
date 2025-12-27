@@ -420,6 +420,7 @@ renderCUDA(
 		float ndotl = 0.0f;
 
 		#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
+		#if ENABLE_FORWARD
 			// surfel normal
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 
@@ -441,7 +442,7 @@ renderCUDA(
 			/*ndotl = n.x * light_dir.x
 				+ n.y * light_dir.y
 				+ n.z * light_dir.z;*/
-			float3 cam_forward_world = make_float3(
+			/*float3 cam_forward_world = make_float3(
 				viewmatrix[2],
 				viewmatrix[6],
 				viewmatrix[10]
@@ -460,7 +461,8 @@ renderCUDA(
 				cam_forward_world = make_float3(0,0,1);
 			}
 
-			light_dir = cam_forward_world;
+			light_dir = cam_forward_world;*/
+			light_dir = make_float3(0.f, 0.f, -1.f); // or (0,0,-1)
 			ndotl = n.x * light_dir.x
 				+ n.y * light_dir.y
 				+ n.z * light_dir.z;
@@ -486,8 +488,8 @@ renderCUDA(
 				} else {
 					specular = 0.0f;
 				}
-		#   endif
-
+		#	endif
+		#endif
 		#else
 			// No Lambert and no Phong: pure 2DGS
 			lambert  = 1.0f;
