@@ -219,6 +219,8 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
+	float accum_eff[C] = {0};
+	float last_eff[C]  = {0};
 	float dL_dpixel[C];
 
 #if RENDER_AXUTILITY
@@ -424,18 +426,20 @@ renderCUDA(
 
 		for (int ch = 0; ch < C; ch++)
 		{
-			const float c = collected_colors[ch * BLOCK_SIZE + j];
+		const float c = collected_colors[ch * BLOCK_SIZE + j];
+		const float dL_dchannel = dL_dpixel[ch];
 
-			// same recurrence as before
-			accum_rec[ch] = last_alpha * last_color[ch]
-						+ (1.f - last_alpha) * accum_rec[ch];
-			last_color[ch] = c;
+		// ----- effective emitted term for this layer -----
+		float eff = diffuse_shading * c;
+		if (ch < 3) eff += spec_term;  // only if forward adds spec to RGB
 
-			const float dL_dchannel = dL_dpixel[ch];
+		// ----- recurrence for "behind" effective term -----
+		accum_eff[ch] = last_alpha * last_eff[ch]
+					+ (1.f - last_alpha) * accum_eff[ch];
+		last_eff[ch] = eff;
 
-			// shading factor appears in alpha gradient
-			float contrib = diffuse_shading * (c - accum_rec[ch]);
-			dL_dalpha += contrib * dL_dchannel;;
+		// ----- alpha gradient uses effective term -----
+		dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
 
 		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
 			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
@@ -445,6 +449,7 @@ renderCUDA(
 		#endif
 
 			// ∂I/∂c = w * shading
+			// color gradient: only diffuse is tinted by base color (see dchannel_dcolor)
 			atomicAdd(&(dL_dcolors[global_id * C + ch]),
 					dchannel_dcolor * dL_dchannel);
 		}
