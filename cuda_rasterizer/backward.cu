@@ -219,6 +219,10 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
+
+	float accum_eff[C] = {0};
+	float last_eff[C]  = {0};
+
 	float dL_dpixel[C];
 
 #if RENDER_AXUTILITY
@@ -398,14 +402,21 @@ renderCUDA(
 				} else {
 					specular = 0.0f;
 				}
-				spec_term = fminf(PHONG_KS * specular, 1.0f); // IMPORTANT: do NOT add into diffuse_shading
+				spec_term = fminf(PHONG_KS * specular, 1.0f);
 			#endif
 
 			#else
+				lambert = 1.0f;
 				diffuse_shading = 1.0f;
     			spec_term = 0.0f;
 			#endif
 // --------------------------------------------------------------
+
+		// energy compensation if spec is actually used
+		#if ENABLE_PHONG_SPECULAR
+			diffuse_shading *= (1.0f - PHONG_KS);
+			spec_term *= lambert;              // masks spec on backfaces
+		#endif
 
 		const float w = alpha * T;
 		const float dchannel_dcolor = w * diffuse_shading;
@@ -425,24 +436,29 @@ renderCUDA(
 		for (int ch = 0; ch < C; ch++)
 		{
 			const float c = collected_colors[ch * BLOCK_SIZE + j];
+            const float dL_dchannel = dL_dpixel[ch];
 
-			// same recurrence as before
-			accum_rec[ch] = last_alpha * last_color[ch]
-						+ (1.f - last_alpha) * accum_rec[ch];
-			last_color[ch] = c;
+            float eff = diffuse_shading * c;
+            #if ENABLE_PHONG_SPECULAR
+                if (ch < 3) eff += spec_term;    // only if RGB in forward
+            #endif
 
-			const float dL_dchannel = dL_dpixel[ch];
+            accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
+            last_eff[ch] = eff;
 
-			// shading factor appears in alpha gradient
-			float contrib = diffuse_shading * (c - accum_rec[ch]);
-			dL_dalpha += contrib * dL_dchannel;;
+            // shading factor appears in alpha gradient
+            dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
 
 		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
 			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
 			// I_ch += w * shading * c  ⇒ ∂I/∂shading = w * c
 			dL_ddiffuse += dL_dchannel * (w * c);
-			if (ch < 3) dL_dspec += dL_dchannel * w;   // only if ch is an RGB channel
 		#endif
+
+		#if ENABLE_PHONG_SPECULAR
+            // ∂I/∂spec_term = w, but only for RGB channels
+            if (ch < 3) dL_dspec += dL_dchannel * w;
+        #endif
 
 			// ∂I/∂c = w * shading
 			atomicAdd(&(dL_dcolors[global_id * C + ch]),

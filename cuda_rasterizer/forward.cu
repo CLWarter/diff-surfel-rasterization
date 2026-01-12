@@ -472,15 +472,21 @@ renderCUDA(
 				} else {
 					specular = 0.0f;
 				}
-				spec_term = fminf(PHONG_KS * specular, 1.0f); // IMPORTANT: do NOT add into diffuse_shading
-			#endif
-
+				spec_term = fminf(PHONG_KS * specular, 1.0f);
+				#endif
 			#else
+				lambert = 1.0f;
 				diffuse_shading = 1.0f;
     			spec_term = 0.0f;
 			#endif
 
             // ---------------------------------------------------------------
+
+            // energy compensation if spec is actually used
+            #if ENABLE_PHONG_SPECULAR
+                diffuse_shading *= (1.0f - PHONG_KS);
+                spec_term *= lambert;              // masks spec on backfaces
+            #endif
 
             float w       = alpha * T;
 
@@ -512,12 +518,15 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * w_diff;
-			// add white specular (or light color) only if RGB
-			if (CHANNELS >= 3) {
-				C[0] += w_spec;
-				C[1] += w_spec;
-				C[2] += w_spec;
-			}
+
+			// add spec to RGB only
+			#if ENABLE_PHONG_SPECULAR
+				if (CHANNELS >= 3) {
+					C[0] += w_spec;
+					C[1] += w_spec;
+					C[2] += w_spec;
+				}
+			#endif
 			T = test_T;
 
 			// Keep track of last range entry to update this
