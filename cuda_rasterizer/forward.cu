@@ -412,102 +412,83 @@ renderCUDA(
 				done = true;
 				continue;
 			}
-		// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
-		float shading;        // final shading multiplier
-		float lambert = 1.0f; // diffuse part
-		float specular = 0.0f;
-		float3 light_dir;
-		float ndotl = 0.0f;
+			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
+			float diffuse_shading = 1.0f;   // multiplies base color
+			float spec_term       = 0.0f;   // added (usually white)
+			float lambert         = 1.0f;
+			float specular        = 0.0f;
+			float ndotl           = 0.0f;
+			const float ambient = 0.20f;
 
-		#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
-		#if ENABLE_FORWARD
-			// surfel normal
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
+			float3 L = make_float3(0,0,1);
+			float3 V = make_float3(0,0,1);
 
-			// normalize n
-			float len2_n = n.x * n.x + n.y * n.y + n.z * n.z;
-			if (len2_n > 1e-8f) {
-				float inv_n = rsqrtf(len2_n);
-				n.x *= inv_n;
-				n.y *= inv_n;
-				n.z *= inv_n;
-			}
+			#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
+				float len2 = n.x*n.x + n.y*n.y + n.z*n.z;
+				if (len2 > 1e-8f) {
+					float inv_n = rsqrtf(len2);
+					n.x *= inv_n; n.y *= inv_n; n.z *= inv_n;
+				} else {
+					n = make_float3(0.f, 0.f, 1.f);
+				}
 
-			// flashlight at/near camera: direction from camera to pixel (view ray)
-			/*light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
-			light_dir.x = -light_dir.x;
-			light_dir.y = -light_dir.y;
-			light_dir.z = -light_dir.z;*/
-			// Direction from Surface TO Light
-			/*ndotl = n.x * light_dir.x
-				+ n.y * light_dir.y
-				+ n.z * light_dir.z;*/
-			/*float3 cam_forward_world = make_float3(
-				viewmatrix[2],
-				viewmatrix[6],
-				viewmatrix[10]
-			);
+				float3 view_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
+				V = make_float3(-view_dir.x, -view_dir.y, -view_dir.z);
 
-			float len2 = cam_forward_world.x * cam_forward_world.x +
-						cam_forward_world.y * cam_forward_world.y +
-						cam_forward_world.z * cam_forward_world.z;
+			#if USE_HEADLIGHT
+				L = make_float3(0.f, 0.f, 1.f); // or +1 if your normals are flipped
+			#else
+				L = make_float3(-view_dir.x, -view_dir.y, -view_dir.z);
+			#endif
 
-			if (len2 > 1e-12f) {
-				float inv_len = rsqrtf(len2);
-				cam_forward_world.x *= inv_len;
-				cam_forward_world.y *= inv_len;
-				cam_forward_world.z *= inv_len;
-			} else {
-				cam_forward_world = make_float3(0,0,1);
-			}
+				float l2 = L.x*L.x + L.y*L.y + L.z*L.z;
+				if (l2 > 1e-8f) { float inv = rsqrtf(l2); L.x*=inv; L.y*=inv; L.z*=inv; }
 
-			light_dir = cam_forward_world;*/
-			light_dir = make_float3(0.f, 0.f, -1.f); // or (0,0,-1)
-			ndotl = n.x * light_dir.x
-				+ n.y * light_dir.y
-				+ n.z * light_dir.z;
+				ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
 
-			// --- Lambert diffuse ---------------------------------------------------
-		#   if ENABLE_LAMBERT_SHADING
-		#       if USE_ABS_COS_SHADING
+			#if ENABLE_LAMBERT_SHADING
+			#   if USE_ABS_COS_SHADING
 					lambert = fabsf(ndotl);
-		#       else
+			#   else
 					lambert = fmaxf(ndotl, 0.0f);
-		#       endif
-		#   else
-				lambert = 1.0f;    // if Lambert disabled but Phong enabled
-		#   endif
+			#   endif
+			#else
+				lambert = 1.0f;
+			#endif
 
-			// --- Phong/Blinn-like specular ----------------------------------------
-		#   if ENABLE_PHONG_SPECULAR
-				// For camera-mounted flashlight, view_dir ≈ light_dir
-				float ndotl_clamped = fmaxf(ndotl, 0.0f);
-				if (ndotl_clamped > 0.0f) {
-					// Simple Phong: spec = (n·l)^shininess
-					specular = powf(ndotl_clamped, PHONG_SHININESS);
+			diffuse_shading = ambient + (1.0f - ambient) * lambert;
+
+			#if ENABLE_PHONG_SPECULAR
+				// H = normalize(L + V)
+				float3 H = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
+				float h2 = H.x*H.x + H.y*H.y + H.z*H.z;
+				if (h2 > 1e-8f) {
+					float invh = rsqrtf(h2);
+					H.x *= invh; H.y *= invh; H.z *= invh;
+
+					float ndoth = fmaxf(n.x*H.x + n.y*H.y + n.z*H.z, 0.0f);
+					specular = powf(ndoth, PHONG_SHININESS);
 				} else {
 					specular = 0.0f;
 				}
-		#	endif
-		#endif
-		#else
-			// No Lambert and no Phong: pure 2DGS
-			lambert  = 1.0f;
-			specular = 0.0f;
-			light_dir = make_float3(0.0f, 0.0f, 1.0f);
-			ndotl    = 0.0f;
-		#endif
+				spec_term = fminf(PHONG_KS * specular, 1.0f);
+				#endif
+			#else
+				lambert = 1.0f;
+				diffuse_shading = 1.0f;
+    			spec_term = 0.0f;
+			#endif
 
-		// Combine terms: diffuse + ks * spec
-		shading = lambert;
-		#if ENABLE_PHONG_SPECULAR
-				+ PHONG_KS * specular
-		#endif
-		;
             // ---------------------------------------------------------------
 
             float w       = alpha * T;
-            float w_color = w * shading;
+
+			// diffuse: tinted
+			float w_diff = w * diffuse_shading;
+
+			// specular: additive (not tinted)
+			float w_spec = w * spec_term;
 
 #if RENDER_AXUTILITY
 			// Render depth distortion map
@@ -530,7 +511,16 @@ renderCUDA(
 
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * w_color;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * w_diff;
+
+			// add spec to RGB only
+			#if ENABLE_PHONG_SPECULAR
+				if (CHANNELS >= 3) {
+					C[0] += w_spec;
+					C[1] += w_spec;
+					C[2] += w_spec;
+				}
+			#endif
 			T = test_T;
 
 			// Keep track of last range entry to update this
