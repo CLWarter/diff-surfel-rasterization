@@ -5,3 +5,4 @@ dist/
 .vscode
 **__pycache__**
 *.pyc
+diff_surfel_rasterization/_C.cp310-win_amd64.pyd
