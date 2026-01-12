@@ -76,7 +76,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.sh_degree,
             raster_settings.campos,
             raster_settings.prefiltered,
-            raster_settings.debug
+            raster_settings.debug,
+            raster_settings.ambient
         )
 
         # Invoke C++/CUDA rasterizer
@@ -127,7 +128,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 num_rendered,
                 binningBuffer,
                 imgBuffer,
-                raster_settings.debug)
+                raster_settings.debug,
+                raster_settings.ambient)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -168,6 +170,7 @@ class GaussianRasterizationSettings(NamedTuple):
     campos : torch.Tensor
     prefiltered : bool
     debug : bool
+    ambient : float
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

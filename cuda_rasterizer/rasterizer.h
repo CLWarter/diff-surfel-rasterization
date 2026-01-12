@@ -50,6 +50,7 @@ namespace CudaRasterizer
 			const bool prefiltered,
 			float* out_color,
 			float* out_others,
+			const float ambient,
 			int* radii = nullptr,
 			bool debug = false);
 
@@ -83,7 +84,8 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
-			bool debug);
+			bool debug,
+			const float ambient);
 	};
 };
 
