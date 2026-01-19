@@ -418,7 +418,7 @@ renderCUDA(
 			float lambert         = 1.0f;
 			float specular        = 0.0f;
 			float ndotl           = 0.0f;
-			const float ambient = 0.20f;
+			const float ambient = 0.2f;
 
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 			float3 L = make_float3(0,0,1);
@@ -437,9 +437,10 @@ renderCUDA(
 				V = make_float3(-view_dir.x, -view_dir.y, -view_dir.z);
 
 			#if USE_HEADLIGHT
-				L = make_float3(0.f, 0.f, 1.f); // or +1 if your normals are flipped
+				//L = make_float3(0.f, 0.f, 1.f); // or +1 if your normals are flipped
+				L = make_float3(0.f, 0.f, 1.f);
 			#else
-				L = make_float3(-view_dir.x, -view_dir.y, -view_dir.z);
+				L = V;
 			#endif
 
 				float l2 = L.x*L.x + L.y*L.y + L.z*L.z;
@@ -472,7 +473,7 @@ renderCUDA(
 				} else {
 					specular = 0.0f;
 				}
-				spec_term = fminf(PHONG_KS * specular, 1.0f);
+				spec_term = PHONG_KS * specular;//fminf(PHONG_KS * specular, 1.0f);
 				#endif
 			#else
 				lambert = 1.0f;
@@ -480,6 +481,12 @@ renderCUDA(
     			spec_term = 0.0f;
 			#endif
 
+			#if ENABLE_LAMBERT_SHADING
+			diffuse_shading *= (1.0f - PHONG_KS);  // crude energy compensation
+			#endif
+			#if ENABLE_PHONG_SPECULAR
+			spec_term *= lambert;                 // make spec vanish at grazing/back-facing
+			#endif
             // ---------------------------------------------------------------
 
             float w       = alpha * T;

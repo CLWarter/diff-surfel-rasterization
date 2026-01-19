@@ -219,6 +219,8 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
+	float accum_eff[C] = {0};
+	float last_eff[C]   = {0};
 	float dL_dpixel[C];
 
 #if RENDER_AXUTILITY
@@ -339,7 +341,7 @@ renderCUDA(
 
 			
 			// ================= LAMBERT + PHONG SHADING (BACKWARD) ======================
-float diffuse_shading = 1.0f;   // multiplies base color
+			float diffuse_shading = 1.0f;   // multiplies base color
 			float spec_term       = 0.0f;   // added (usually white)
 			float lambert         = 1.0f;
 			float specular        = 0.0f;
@@ -363,9 +365,10 @@ float diffuse_shading = 1.0f;   // multiplies base color
 				V = make_float3(-view_dir.x, -view_dir.y, -view_dir.z);
 
 			#if USE_HEADLIGHT
-				L = make_float3(0.f, 0.f, 1.f); // or +1 if your normals are flipped
+				//L = make_float3(0.f, 0.f, 1.f); // or +1 if your normals are flipped
+				L = make_float3(0.f, 0.f, 1.f);
 			#else
-				L = make_float3(-view_dir.x, -view_dir.y, -view_dir.z);
+				L = V;
 			#endif
 
 				float l2 = L.x*L.x + L.y*L.y + L.z*L.z;
@@ -398,16 +401,26 @@ float diffuse_shading = 1.0f;   // multiplies base color
 				} else {
 					specular = 0.0f;
 				}
-				spec_term = fminf(PHONG_KS * specular, 1.0f);
+				spec_term = PHONG_KS * specular;//fminf(PHONG_KS * specular, 1.0f);
 				#endif
 			#else
 				lambert = 1.0f;
 				diffuse_shading = 1.0f;
     			spec_term = 0.0f;
 			#endif
+
 // --------------------------------------------------------------
 
 		const float w = alpha * T;
+
+		#if ENABLE_LAMBERT_SHADING
+			diffuse_shading *= (1.0f - PHONG_KS);
+		#endif
+		#if ENABLE_PHONG_SPECULAR
+			// only if you kept this in forward; if you commented it out, comment it out here too
+			spec_term *= lambert;
+		#endif
+
 		const float dchannel_dcolor = w * diffuse_shading;
 
 		// gradients w.r.t alpha
@@ -415,7 +428,7 @@ float diffuse_shading = 1.0f;   // multiplies base color
 
 		// accumulate dL/d(shading) if any normal grads are enabled
 		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
-			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
+			(ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD)
 			float dL_ddiffuse = 0.0f;
 			float dL_dspec = 0.0f;
 		#endif
@@ -426,23 +439,34 @@ float diffuse_shading = 1.0f;   // multiplies base color
 		{
 			const float c = collected_colors[ch * BLOCK_SIZE + j];
 
+			const float dL_dchannel = dL_dpixel[ch];
+
 			// same recurrence as before
 			accum_rec[ch] = last_alpha * last_color[ch]
 						+ (1.f - last_alpha) * accum_rec[ch];
 			last_color[ch] = c;
 
-			const float dL_dchannel = dL_dpixel[ch];
+			float eff = diffuse_shading * c;
+			#if ENABLE_PHONG_SPECULAR
+				if (ch < 3) eff += spec_term; // only if forward added spec to RGB
+			#endif
+
+			accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
+			last_eff[ch] = eff;
 
 			// shading factor appears in alpha gradient
-			float contrib = diffuse_shading * (c - accum_rec[ch]);
-			dL_dalpha += contrib * dL_dchannel;
+			dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
 
-		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
-			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
-			// I_ch += w * shading * c  ⇒ ∂I/∂shading = w * c
-			dL_ddiffuse += dL_dchannel * (w * c);
-			if (ch < 3) dL_dspec += dL_dchannel * w;   // only if ch is an RGB channel
-		#endif
+			#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
+				(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
+				// diffuse part: I_ch += w * diffuse_shading * c
+				dL_ddiffuse += dL_dchannel * (w * c);
+
+				// spec part: I_rgb += w * spec_term   (white add)
+			#if ENABLE_PHONG_SPECULAR
+				if (ch < 3) dL_dspec += dL_dchannel * w;
+			#endif
+			#endif
 
 			// ∂I/∂c = w * shading
 			atomicAdd(&(dL_dcolors[global_id * C + ch]),
@@ -455,28 +479,37 @@ float diffuse_shading = 1.0f;   // multiplies base color
 
 		if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f) {
 
-			// ---- Lambert normal grad (through diffuse_shading) -------------------
+		// --- Lambert path ---
 		#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
-			// diffuse_shading = ambient + (1-ambient)*lambert
-			float dL_dlambert = dL_ddiffuse * (1.0f - ambient);
+			// diffuse_shading = (1-PHONG_KS) * (ambient + (1-ambient)*lambert)
+			float dL_dlambert = dL_ddiffuse * (1.0f - PHONG_KS) * (1.0f - ambient);
+		#else
+			float dL_dlambert = 0.0f;
+		#endif
+
+		// plus: spec_term *= lambert  => spec contributes to lambert too
+		#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
+			// spec_term = lambert * (PHONG_KS * specular)
+			dL_dlambert += dL_dspec * (PHONG_KS * specular);
+		#endif
 
 			float dL_dndotl = 0.0f;
-		#   if USE_ABS_COS_SHADING
-				if (ndotl > 0.0f)       dL_dndotl += dL_dlambert;
-				else if (ndotl < 0.0f)  dL_dndotl -= dL_dlambert;
-		#   else
-				if (ndotl > 0.0f)       dL_dndotl += dL_dlambert; // max(ndotl,0)
-		#   endif
+			#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
+			#   if USE_ABS_COS_SHADING
+					if (ndotl > 0.0f)       dL_dndotl += dL_dlambert;
+					else if (ndotl < 0.0f)  dL_dndotl -= dL_dlambert;
+			#   else
+					if (ndotl > 0.0f)       dL_dndotl += dL_dlambert; // max(ndotl,0)
+			#   endif
+			#endif
 
 			if (dL_dndotl != 0.0f) {
 				atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndotl * L.x);
 				atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndotl * L.y);
 				atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndotl * L.z);
 			}
-		#endif // Lambert normal grad
 
-
-			// ---- Blinn-Phong normal grad (through spec_term) ---------------------
+		// ---- Specular ndoth path ---------------------
 		#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
 			if (dL_dspec != 0.0f) {
 				float3 Hh = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
@@ -489,8 +522,11 @@ float diffuse_shading = 1.0f;   // multiplies base color
 					if (ndoth > 0.0f) {
 						float spec_deriv = PHONG_SHININESS * powf(ndoth, PHONG_SHININESS - 1.0f);
 
-						// spec_term = PHONG_KS * specular => d(spec_term)/d(ndoth) = PHONG_KS * spec_deriv
-						float dL_dndoth = dL_dspec * PHONG_KS * spec_deriv;
+						float scale = PHONG_KS;
+						scale *= lambert;
+						// spec_term = lambert * (PHONG_KS * specular)
+						// => d(spec_term)/d(ndoth) = lambert * PHONG_KS * spec_deriv
+						float dL_dndoth = dL_dspec * scale * spec_deriv;
 
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndoth * Hh.x);
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndoth * Hh.y);
@@ -500,7 +536,7 @@ float diffuse_shading = 1.0f;   // multiplies base color
 			}
 		#endif // Phong normal grad
 
-		} // if any grad
+		}
 
 		#endif
 		// --------------------------------------------------------------------------
