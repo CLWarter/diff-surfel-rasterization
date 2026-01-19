@@ -361,12 +361,14 @@ renderCUDA(
 					n = make_float3(0.f, 0.f, 1.f);
 				}
 
-				float3 view_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
-				V = make_float3(-view_dir.x, -view_dir.y, -view_dir.z);
+				// light dir: camera -> surface
+				float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
+				// V turns the light dir to the surface -> camera
+				V = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);
 
 			#if USE_HEADLIGHT
-				//L = make_float3(0.f, 0.f, 1.f); // or +1 if your normals are flipped
-				L = make_float3(0.f, 0.f, 1.f);
+				//L = make_float3(0.f, 0.f, 1.f); // -1 in z -> light_dir towards Camera
+				L = make_float3(0.f, 0.f, -1.f);
 			#else
 				L = V;
 			#endif
@@ -374,7 +376,33 @@ renderCUDA(
 				float l2 = L.x*L.x + L.y*L.y + L.z*L.z;
 				if (l2 > 1e-8f) { float inv = rsqrtf(l2); L.x*=inv; L.y*=inv; L.z*=inv; }
 
-				ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
+			/*
+			// Spotlight direction: camera forward (so +Z) in camera space
+			const float3 spotDir = make_float3(0.f, 0.f, 1.f);
+
+			// cos angle between camera->surface and spotlight axis
+			float cosTheta = light_dir.x*spotDir.x + light_dir.y*spotDir.y + light_dir.z*spotDir.z;
+			
+			// cone angles (try to find one fitting the flashlight)
+			const float innerCos = 0.98; // about 11,5 degree 
+			const float outerCos = 0.92; // about 23,1 degree
+
+			// Smoothstep-ramp
+			float spot = 0.0f;
+			if (cosTheta >= innerCos) {
+				spot = 1.0f;
+			} else if (cosTheta <= outerCos) {
+				spot = 0.0f;
+			} else {
+				float t = (cosTheta - outerCos) / (innerCos - outerCos);
+				spot = t * t * (3.0f - 2.0f * t);
+			}
+			
+			// optional: make it “tighter / stronger”
+			// spot = spot * spot; // uncomment to sharpen
+			*/
+
+			ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
 
 			#if ENABLE_LAMBERT_SHADING
 			#   if USE_ABS_COS_SHADING
@@ -386,7 +414,7 @@ renderCUDA(
 				lambert = 1.0f;
 			#endif
 
-			diffuse_shading = ambient + (1.0f - ambient) * lambert;
+			diffuse_shading = (ambient + (1.0f - ambient) * lambert); // * spot;
 
 			#if ENABLE_PHONG_SPECULAR
 				// H = normalize(L + V)
@@ -401,7 +429,7 @@ renderCUDA(
 				} else {
 					specular = 0.0f;
 				}
-				spec_term = PHONG_KS * specular;//fminf(PHONG_KS * specular, 1.0f);
+				spec_term = PHONG_KS * specular ; //* spot;
 				#endif
 			#else
 				lambert = 1.0f;
@@ -412,14 +440,6 @@ renderCUDA(
 // --------------------------------------------------------------
 
 		const float w = alpha * T;
-
-		#if ENABLE_LAMBERT_SHADING
-			diffuse_shading *= (1.0f - PHONG_KS);
-		#endif
-		#if ENABLE_PHONG_SPECULAR
-			// only if you kept this in forward; if you commented it out, comment it out here too
-			spec_term *= lambert;
-		#endif
 
 		const float dchannel_dcolor = w * diffuse_shading;
 
@@ -441,14 +461,13 @@ renderCUDA(
 
 			const float dL_dchannel = dL_dpixel[ch];
 
-			// same recurrence as before
 			accum_rec[ch] = last_alpha * last_color[ch]
 						+ (1.f - last_alpha) * accum_rec[ch];
 			last_color[ch] = c;
 
 			float eff = diffuse_shading * c;
 			#if ENABLE_PHONG_SPECULAR
-				if (ch < 3) eff += spec_term; // only if forward added spec to RGB
+				if (ch < 3) eff += spec_term;
 			#endif
 
 			accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
@@ -482,7 +501,7 @@ renderCUDA(
 		// --- Lambert path ---
 		#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
 			// diffuse_shading = (1-PHONG_KS) * (ambient + (1-ambient)*lambert)
-			float dL_dlambert = dL_ddiffuse * (1.0f - PHONG_KS) * (1.0f - ambient);
+			float dL_dlambert = dL_ddiffuse * (1.0f - PHONG_KS) * (1.0f - ambient); // * spot;
 		#else
 			float dL_dlambert = 0.0f;
 		#endif
@@ -490,7 +509,7 @@ renderCUDA(
 		// plus: spec_term *= lambert  => spec contributes to lambert too
 		#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
 			// spec_term = lambert * (PHONG_KS * specular)
-			dL_dlambert += dL_dspec * (PHONG_KS * specular);
+			dL_dlambert += dL_dspec * (PHONG_KS * specular); //* spot;
 		#endif
 
 			float dL_dndotl = 0.0f;
@@ -522,11 +541,8 @@ renderCUDA(
 					if (ndoth > 0.0f) {
 						float spec_deriv = PHONG_SHININESS * powf(ndoth, PHONG_SHININESS - 1.0f);
 
-						float scale = PHONG_KS;
-						scale *= lambert;
-						// spec_term = lambert * (PHONG_KS * specular)
-						// => d(spec_term)/d(ndoth) = lambert * PHONG_KS * spec_deriv
-						float dL_dndoth = dL_dspec * scale * spec_deriv;
+						// spec_term = PHONG_KS * specular => d(spec_term)/d(ndoth) = PHONG_KS * spec_deriv
+						float dL_dndoth = dL_dspec * PHONG_KS * spec_deriv;
 
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndoth * Hh.x);
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndoth * Hh.y);

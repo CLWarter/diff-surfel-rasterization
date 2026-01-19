@@ -29,8 +29,8 @@
 #define ENABLE_PHONG_NORMAL_GRAD 1
 
 // Simple Blinn-Phong-like parameters
-#define PHONG_SHININESS             64.0f   // exponent, tune as you like // was 64
-#define PHONG_KS                    0.10f    // specular strength (relative to diffuse=1) // was 0.1
+#define PHONG_SHININESS             16.0f   // exponent // was 64
+#define PHONG_KS                    0.20f    // specular strength (relative to diffuse=1) // was 0.1
 
 #define USE_ABS_COS_SHADING 0 // 1 for ABS, 0 for max(cos, 0)
 
