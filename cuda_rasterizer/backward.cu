@@ -171,6 +171,7 @@ renderCUDA(
 	const float4* __restrict__ normal_opacity,
 	const float* __restrict__ transMats,
 	const float* __restrict__ colors,
+	const float* __restrict__ ambients,
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
@@ -180,7 +181,8 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_dambients)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -346,7 +348,7 @@ renderCUDA(
 			float lambert         = 1.0f;
 			float specular        = 0.0f;
 			float ndotl           = 0.0f;
-			const float ambient = 0.20f;
+			float ambient = ambients[0];
 
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 			float3 L = make_float3(0,0,1);
@@ -414,6 +416,8 @@ renderCUDA(
 				lambert = 1.0f;
 			#endif
 
+			ambient = fminf(fmaxf(ambient, 0.0f), 1.0f);
+
 			diffuse_shading = (ambient + (1.0f - ambient) * lambert); // * spot;
 
 			#if ENABLE_PHONG_SPECULAR
@@ -453,6 +457,8 @@ renderCUDA(
 			float dL_dspec = 0.0f;
 		#endif
 
+		float dL_ddiffuse_shading = 0.0f;
+
 		const int global_id = collected_id[j];
 
 		for (int ch = 0; ch < C; ch++)
@@ -460,6 +466,8 @@ renderCUDA(
 			const float c = collected_colors[ch * BLOCK_SIZE + j];
 
 			const float dL_dchannel = dL_dpixel[ch];
+
+			dL_ddiffuse_shading += dL_dchannel * (w * c);
 
 			accum_rec[ch] = last_alpha * last_color[ch]
 						+ (1.f - last_alpha) * accum_rec[ch];
@@ -491,6 +499,9 @@ renderCUDA(
 			atomicAdd(&(dL_dcolors[global_id * C + ch]),
 					dchannel_dcolor * dL_dchannel);
 		}
+
+		float d_diffuse_d_ambient = 1.0f - lambert;
+		atomicAdd(&dL_dambients[0], dL_ddiffuse_shading * d_diffuse_d_ambient);
 
 		// ---------- Normal gradient from Lambert + Blinn-Phong --------------------
 		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
@@ -917,6 +928,7 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* normal_opacity,
 	const float* colors,
+	const float* ambients,
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
@@ -927,7 +939,8 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	float* dL_dambient)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -939,6 +952,7 @@ void BACKWARD::render(
 		normal_opacity,
 		transMats,
 		colors,
+		ambients,
 		depths,
 		final_Ts,
 		n_contrib,
@@ -948,6 +962,7 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_dambient
 		);
 }

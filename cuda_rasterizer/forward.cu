@@ -282,6 +282,7 @@ renderCUDA(
 	float focal_x, float focal_y,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ ambients,
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
@@ -418,7 +419,7 @@ renderCUDA(
 			float lambert         = 1.0f;
 			float specular        = 0.0f;
 			float ndotl           = 0.0f;
-			const float ambient = 0.2f;
+			float ambient = ambients[0]; // per-scene scalar
 
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 			float3 L = make_float3(0,0,1);
@@ -485,6 +486,8 @@ renderCUDA(
 			#else
 				lambert = 1.0f;
 			#endif
+
+			ambient = fminf(fmaxf(ambient, 0.0f), 1.0f);
 
 			diffuse_shading = (ambient + (1.0f - ambient) * lambert); //* spot;
 
@@ -595,6 +598,7 @@ void FORWARD::render(
 	float focal_x, float focal_y,
 	const float2* means2D,
 	const float* colors,
+	const float* ambients,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
@@ -611,6 +615,7 @@ void FORWARD::render(
 		focal_x, focal_y,
 		means2D,
 		colors,
+		ambients,
 		transMats,
 		depths,
 		normal_opacity,
