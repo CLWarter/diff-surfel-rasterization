@@ -269,6 +269,18 @@ float3 compute_light_dir(const float2& pixf,
     return v;
 }
 
+__device__ __forceinline__ float sigmoidf_stable(float x)
+{
+    // stable sigmoid to avoid exp overflow
+    if (x >= 0.0f) {
+        float z = expf(-x);
+        return 1.0f / (1.0f + z);
+    } else {
+        float z = expf(x);
+        return z / (1.0f + z);
+    }
+}
+
 
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
@@ -415,11 +427,13 @@ renderCUDA(
 			}
 			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
 			float diffuse_shading = 1.0f;   // multiplies base color
-			float spec_term       = 0.0f;   // added (usually white)
+			float spec_term       = 0.0f;   // additive (usually white)
 			float lambert         = 1.0f;
 			float specular        = 0.0f;
 			float ndotl           = 0.0f;
-			float ambient = ambients[0]; // per-scene scalar
+
+			float ambient_raw = ambients[0]; // per-scene scalar
+			float ambient     = sigmoidf_stable(ambient_raw);
 
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 			float3 L = make_float3(0,0,1);
@@ -471,7 +485,7 @@ renderCUDA(
 				spot = t * t * (3.0f - 2.0f * t);
 			}
 			
-			// optional: make it “tighter / stronger”
+			// optional step: make it “tighter / stronger”
 			// spot = spot * spot; // uncomment to sharpen
 			*/
 
@@ -486,8 +500,6 @@ renderCUDA(
 			#else
 				lambert = 1.0f;
 			#endif
-
-			ambient = fminf(fmaxf(ambient, 0.0f), 1.0f);
 
 			diffuse_shading = (ambient + (1.0f - ambient) * lambert); //* spot;
 

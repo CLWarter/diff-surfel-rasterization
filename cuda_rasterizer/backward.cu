@@ -157,6 +157,18 @@ float3 compute_light_dir(const float2& pixf,
     return v;
 }
 
+__device__ __forceinline__ float sigmoidf_stable(float x)
+{
+    // stable sigmoid to avoid exp overflow
+    if (x >= 0.0f) {
+        float z = expf(-x);
+        return 1.0f / (1.0f + z);
+    } else {
+        float z = expf(x);
+        return z / (1.0f + z);
+    }
+}
+
 
 // Backward version of the rendering procedure.
 template <uint32_t C>
@@ -348,7 +360,9 @@ renderCUDA(
 			float lambert         = 1.0f;
 			float specular        = 0.0f;
 			float ndotl           = 0.0f;
-			float ambient = ambients[0];
+
+			float ambient_raw = ambients[0];
+			float ambient = sigmoidf_stable(ambient_raw);
 
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 			float3 L = make_float3(0,0,1);
@@ -416,8 +430,6 @@ renderCUDA(
 				lambert = 1.0f;
 			#endif
 
-			ambient = fminf(fmaxf(ambient, 0.0f), 1.0f);
-
 			diffuse_shading = (ambient + (1.0f - ambient) * lambert); // * spot;
 
 			#if ENABLE_PHONG_SPECULAR
@@ -441,10 +453,16 @@ renderCUDA(
     			spec_term = 0.0f;
 			#endif
 
+			#if ENABLE_LAMBERT_SHADING
+			diffuse_shading *= (1.0f - PHONG_KS);  // light energy compensation
+			#endif
+			#if ENABLE_PHONG_SPECULAR
+			spec_term *= lambert;                 // make spec vanish at grazing/back-facing
+			#endif
+
 // --------------------------------------------------------------
 
 		const float w = alpha * T;
-
 		const float dchannel_dcolor = w * diffuse_shading;
 
 		// gradients w.r.t alpha
@@ -464,7 +482,6 @@ renderCUDA(
 		for (int ch = 0; ch < C; ch++)
 		{
 			const float c = collected_colors[ch * BLOCK_SIZE + j];
-
 			const float dL_dchannel = dL_dpixel[ch];
 
 			dL_ddiffuse_shading += dL_dchannel * (w * c);
@@ -500,8 +517,13 @@ renderCUDA(
 					dchannel_dcolor * dL_dchannel);
 		}
 
-		float d_diffuse_d_ambient = 1.0f - lambert;
-		atomicAdd(&dL_dambients[0], dL_ddiffuse_shading * d_diffuse_d_ambient);
+		float d_diffuse_d_ambient = (1.0f - lambert);
+		#if ENABLE_LAMBERT_SHADING
+		d_diffuse_d_ambient *= (1.0f - PHONG_KS);
+		#endif
+		float d_ambient_d_raw = ambient * (1.0f - ambient);
+		
+		atomicAdd(&dL_dambients[0], dL_ddiffuse_shading * d_diffuse_d_ambient * d_ambient_d_raw);
 
 		// ---------- Normal gradient from Lambert + Blinn-Phong --------------------
 		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
@@ -553,7 +575,7 @@ renderCUDA(
 						float spec_deriv = PHONG_SHININESS * powf(ndoth, PHONG_SHININESS - 1.0f);
 
 						// spec_term = PHONG_KS * specular => d(spec_term)/d(ndoth) = PHONG_KS * spec_deriv
-						float dL_dndoth = dL_dspec * PHONG_KS * spec_deriv;
+						float dL_dndoth = dL_dspec * (lambert * PHONG_KS) * spec_deriv;
 
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndoth * Hh.x);
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndoth * Hh.y);
