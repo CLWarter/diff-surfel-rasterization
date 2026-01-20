@@ -432,8 +432,9 @@ renderCUDA(
 			float specular        = 0.0f;
 			float ndotl           = 0.0f;
 
-			float ambient_raw = ambients[0]; // per-scene scalar
-			float ambient     = sigmoidf_stable(ambient_raw);
+			const int global_id = collected_id[j];
+			float ambient = 1.0f / (1.0f + expf(-ambients[global_id])); // per-scene scalar
+			ambient = fminf(fmaxf(ambient, 0.0f), 1.0f);
 
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 			float3 L = make_float3(0,0,1);

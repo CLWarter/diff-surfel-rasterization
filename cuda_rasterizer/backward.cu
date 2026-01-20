@@ -361,8 +361,9 @@ renderCUDA(
 			float specular        = 0.0f;
 			float ndotl           = 0.0f;
 
-			float ambient_raw = ambients[0];
-			float ambient = sigmoidf_stable(ambient_raw);
+			const int global_id = collected_id[j];
+			float ambient = 1.0f / (1.0f + expf(-ambients[global_id])); // per-gaussian scalar
+			ambient = fminf(fmaxf(ambient, 0.0f), 1.0f);
 
 			float3 n = make_float3(normal[0], normal[1], normal[2]);
 			float3 L = make_float3(0,0,1);
@@ -477,8 +478,6 @@ renderCUDA(
 
 		float dL_ddiffuse_shading = 0.0f;
 
-		const int global_id = collected_id[j];
-
 		for (int ch = 0; ch < C; ch++)
 		{
 			const float c = collected_colors[ch * BLOCK_SIZE + j];
@@ -523,7 +522,7 @@ renderCUDA(
 		#endif
 		float d_ambient_d_raw = ambient * (1.0f - ambient);
 		
-		atomicAdd(&dL_dambients[0], dL_ddiffuse_shading * d_diffuse_d_ambient * d_ambient_d_raw);
+		atomicAdd(&dL_dambients[global_id], dL_ddiffuse_shading * d_diffuse_d_ambient * d_ambient_d_raw);
 
 		// ---------- Normal gradient from Lambert + Blinn-Phong --------------------
 		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
