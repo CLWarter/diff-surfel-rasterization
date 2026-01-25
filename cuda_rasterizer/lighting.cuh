@@ -10,6 +10,26 @@ struct LightingOut {
     float ambient;     // ambient value
 };
 
+__device__ __forceinline__ float3 apply_norm_jacobian(float3 n_raw, float3 g_unit)
+{
+    // n_hat = n_raw / ||n_raw||
+    float len2 = n_raw.x*n_raw.x + n_raw.y*n_raw.y + n_raw.z*n_raw.z;
+    if (len2 <= 1e-20f) return make_float3(0.f, 0.f, 0.f);
+
+    float inv_len = rsqrtf(len2);
+    float3 n_hat = make_float3(n_raw.x * inv_len, n_raw.y * inv_len, n_raw.z * inv_len);
+
+    // Project g_unit onto tangent plane
+    float dotng = n_hat.x*g_unit.x + n_hat.y*g_unit.y + n_hat.z*g_unit.z;
+    float3 g_proj = make_float3(
+        g_unit.x - n_hat.x * dotng,
+        g_unit.y - n_hat.y * dotng,
+        g_unit.z - n_hat.z * dotng
+    );
+    // Normalize
+    return make_float3(g_proj.x * inv_len, g_proj.y * inv_len, g_proj.z * inv_len);
+}
+
 __device__ __forceinline__
 float3 compute_light_dir(const float2& pixf,
                                    int W, int H,

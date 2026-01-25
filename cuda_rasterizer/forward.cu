@@ -396,36 +396,19 @@ renderCUDA(
 				continue;
 			}
 			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
+			float w      = alpha * T;
+			float w_diff = w;        // default, no lighting
+			float w_spec = 0.0f;     // default, no spec
+
 			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
 				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients);
 
-				float w      = alpha * T;
-				float w_diff = w * Lout.diffuse_mul;
-				float w_spec = w * Lout.spec_add;
+				w_diff = w * Lout.diffuse_mul;
 
-				// Diffuse
-				#pragma unroll
-				for (int ch = 0; ch < CHANNELS; ch++) {
-					C[ch] += features[collected_id[j] * CHANNELS + ch] * w_diff;
-				}
-
-				// Specular added to RGB
 				#if LIGHT_USE_PHONG
-				if (CHANNELS >= 3) {
-					C[0] += w_spec;
-					C[1] += w_spec;
-					C[2] += w_spec;
-				}
+					w_spec = w * Lout.spec_add;
 				#endif
-
-			#else
-				// No lighting, original behavior
-				float w = alpha * T;
-				#pragma unroll
-				for (int ch = 0; ch < CHANNELS; ch++) {
-					C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
-				}
 			#endif
 
 #if RENDER_AXUTILITY
@@ -447,18 +430,22 @@ renderCUDA(
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
 #endif
 
+			// Diffuse
+			#pragma unroll
 			// Eq. (3) from 3D Gaussian splatting paper.
-			for (int ch = 0; ch < CHANNELS; ch++)
+			for (int ch = 0; ch < CHANNELS; ch++) {
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * w_diff;
+			}
 
-			// add spec to RGB only
-			#if ENABLE_PHONG_SPECULAR
-				if (CHANNELS >= 3) {
-					C[0] += w_spec;
-					C[1] += w_spec;
-					C[2] += w_spec;
-				}
+			// Specular added to RGB
+			#if LIGHT_USE_PHONG
+			if (CHANNELS >= 3) {
+				C[0] += w_spec;
+				C[1] += w_spec;
+				C[2] += w_spec;
+			}
 			#endif
+
 			T = test_T;
 
 			// Keep track of last range entry to update this
