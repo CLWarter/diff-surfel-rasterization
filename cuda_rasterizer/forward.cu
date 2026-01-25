@@ -11,6 +11,7 @@
 
 #include "forward.h"
 #include "auxiliary.h"
+#include "lighting.cuh"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -250,37 +251,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
-__device__ __forceinline__
-float3 compute_light_dir(const float2& pixf,
-                                   int W, int H,
-                                   float focal_x, float focal_y)
-{
-    float x = (pixf.x - 0.5f * (float)W) / focal_x;
-    float y = (pixf.y - 0.5f * (float)H) / focal_y;
-    float3 v = make_float3(x, y, 1.0f);
-
-    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
-    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 1.f);
-
-    float inv_len = rsqrtf(len2);
-    v.x *= inv_len;
-    v.y *= inv_len;
-    v.z *= inv_len;
-    return v;
-}
-
-__device__ __forceinline__ float sigmoidf_stable(float x)
-{
-    // stable sigmoid to avoid exp overflow
-    if (x >= 0.0f) {
-        float z = expf(-x);
-        return 1.0f / (1.0f + z);
-    } else {
-        float z = expf(x);
-        return z / (1.0f + z);
-    }
-}
-
 
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
@@ -426,119 +396,37 @@ renderCUDA(
 				continue;
 			}
 			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
-			float diffuse_shading = 1.0f;   // multiplies base color
-			float spec_term       = 0.0f;   // additive (usually white)
-			float lambert         = 1.0f;
-			float specular        = 0.0f;
-			float ndotl           = 0.0f;
+			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients);
 
-			float ambient_raw = ambients[0]; // per-scene scalar
-			float ambient     = sigmoidf_stable(ambient_raw);
+				float w      = alpha * T;
+				float w_diff = w * Lout.diffuse_mul;
+				float w_spec = w * Lout.spec_add;
 
-			float3 n = make_float3(normal[0], normal[1], normal[2]);
-			float3 L = make_float3(0,0,1);
-			float3 V = make_float3(0,0,1);
-
-			#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
-				float len2 = n.x*n.x + n.y*n.y + n.z*n.z;
-				if (len2 > 1e-8f) {
-					float inv_n = rsqrtf(len2);
-					n.x *= inv_n; n.y *= inv_n; n.z *= inv_n;
-				} else {
-					n = make_float3(0.f, 0.f, 1.f);
+				// Diffuse
+				#pragma unroll
+				for (int ch = 0; ch < CHANNELS; ch++) {
+					C[ch] += features[collected_id[j] * CHANNELS + ch] * w_diff;
 				}
 
-				// light dir: camera -> surface
-				float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
-				// V turns the light dir to the surface -> camera
-				V = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);
-
-			#if USE_HEADLIGHT
-				//L = make_float3(0.f, 0.f, 1.f); // -1 in z -> light_dir towards Camera
-				L = make_float3(0.f, 0.f, -1.f);
-			#else
-				L = V;
-			#endif
-
-				float l2 = L.x*L.x + L.y*L.y + L.z*L.z;
-				if (l2 > 1e-8f) { float inv = rsqrtf(l2); L.x*=inv; L.y*=inv; L.z*=inv; }
-
-			/*
-			// Spotlight direction: camera forward (so +Z) in camera space
-			const float3 spotDir = make_float3(0.f, 0.f, 1.f);
-
-			// cos angle between camera->surface and spotlight axis
-			float cosTheta = light_dir.x*spotDir.x + light_dir.y*spotDir.y + light_dir.z*spotDir.z;
-			
-			// cone angles (try to find one fitting the flashlight)
-			const float innerCos = 0.98; // about 11,5 degree 
-			const float outerCos = 0.92; // about 23,1 degree
-
-			// Smoothstep-ramp
-			float spot = 0.0f;
-			if (cosTheta >= innerCos) {
-				spot = 1.0f;
-			} else if (cosTheta <= outerCos) {
-				spot = 0.0f;
-			} else {
-				float t = (cosTheta - outerCos) / (innerCos - outerCos);
-				spot = t * t * (3.0f - 2.0f * t);
-			}
-			
-			// optional step: make it “tighter / stronger”
-			// spot = spot * spot; // uncomment to sharpen
-			*/
-
-			ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
-
-			#if ENABLE_LAMBERT_SHADING
-			#   if USE_ABS_COS_SHADING
-					lambert = fabsf(ndotl);
-			#   else
-					lambert = fmaxf(ndotl, 0.0f);
-			#   endif
-			#else
-				lambert = 1.0f;
-			#endif
-
-			diffuse_shading = (ambient + (1.0f - ambient) * lambert); //* spot;
-
-			#if ENABLE_PHONG_SPECULAR
-				// H = normalize(L + V)
-				float3 H = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
-				float h2 = H.x*H.x + H.y*H.y + H.z*H.z;
-				if (h2 > 1e-8f) {
-					float invh = rsqrtf(h2);
-					H.x *= invh; H.y *= invh; H.z *= invh;
-
-					float ndoth = fmaxf(n.x*H.x + n.y*H.y + n.z*H.z, 0.0f);
-					specular = powf(ndoth, PHONG_SHININESS);
-				} else {
-					specular = 0.0f;
+				// Specular added to RGB
+				#if LIGHT_USE_PHONG
+				if (CHANNELS >= 3) {
+					C[0] += w_spec;
+					C[1] += w_spec;
+					C[2] += w_spec;
 				}
-				spec_term = PHONG_KS * specular; // * spot;
 				#endif
+
 			#else
-				lambert = 1.0f;
-				diffuse_shading = 1.0f;
-    			spec_term = 0.0f;
+				// No lighting, original behavior
+				float w = alpha * T;
+				#pragma unroll
+				for (int ch = 0; ch < CHANNELS; ch++) {
+					C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
+				}
 			#endif
-
-			#if ENABLE_LAMBERT_SHADING
-			diffuse_shading *= (1.0f - PHONG_KS);  // light energy compensation
-			#endif
-			#if ENABLE_PHONG_SPECULAR
-			spec_term *= lambert;                 // make spec vanish at grazing/back-facing
-			#endif
-            // ---------------------------------------------------------------
-
-            float w       = alpha * T;
-
-			// diffuse: tinted
-			float w_diff = w * diffuse_shading;
-
-			// specular: additive (not tinted)
-			float w_spec = w * spec_term;
 
 #if RENDER_AXUTILITY
 			// Render depth distortion map

@@ -11,6 +11,7 @@
 
 #include "backward.h"
 #include "auxiliary.h"
+#include "lighting.cuh"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -138,37 +139,6 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
-__device__ __forceinline__
-float3 compute_light_dir(const float2& pixf,
-                                   int W, int H,
-                                   float focal_x, float focal_y)
-{
-    float x = (pixf.x - 0.5f * (float)W) / focal_x;
-    float y = (pixf.y - 0.5f * (float)H) / focal_y;
-    float3 v = make_float3(x, y, 1.0f);
-
-    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
-    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 1.f);
-
-    float inv_len = rsqrtf(len2);
-    v.x *= inv_len;
-    v.y *= inv_len;
-    v.z *= inv_len;
-    return v;
-}
-
-__device__ __forceinline__ float sigmoidf_stable(float x)
-{
-    // stable sigmoid to avoid exp overflow
-    if (x >= 0.0f) {
-        float z = expf(-x);
-        return 1.0f / (1.0f + z);
-    } else {
-        float z = expf(x);
-        return z / (1.0f + z);
-    }
-}
-
 
 // Backward version of the rendering procedure.
 template <uint32_t C>
@@ -283,6 +253,12 @@ renderCUDA(
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
+	// per-thread accumulator for ambient gradient
+	float dAmb = 0.0f;
+
+	// shared buffer for block reduction
+	__shared__ float amb_reduce[BLOCK_SIZE];
+
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -355,240 +331,235 @@ renderCUDA(
 
 			
 			// ================= LAMBERT + PHONG SHADING (BACKWARD) ======================
-			float diffuse_shading = 1.0f;   // multiplies base color
-			float spec_term       = 0.0f;   // added (usually white)
-			float lambert         = 1.0f;
-			float specular        = 0.0f;
-			float ndotl           = 0.0f;
+			#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients);
 
-			float ambient_raw = ambients[0];
-			float ambient = sigmoidf_stable(ambient_raw);
+				const float w = alpha * T;
+				const float dchannel_dcolor = w * Lout.diffuse_mul;
 
-			float3 n = make_float3(normal[0], normal[1], normal[2]);
-			float3 L = make_float3(0,0,1);
-			float3 V = make_float3(0,0,1);
+				float dL_dalpha = 0.0f;
 
-			#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
-				float len2 = n.x*n.x + n.y*n.y + n.z*n.z;
-				if (len2 > 1e-8f) {
-					float inv_n = rsqrtf(len2);
-					n.x *= inv_n; n.y *= inv_n; n.z *= inv_n;
-				} else {
-					n = make_float3(0.f, 0.f, 1.f);
-				}
-
-				// light dir: camera -> surface
-				float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
-				// V turns the light dir to the surface -> camera
-				V = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);
-
-			#if USE_HEADLIGHT
-				//L = make_float3(0.f, 0.f, 1.f); // -1 in z -> light_dir towards Camera
-				L = make_float3(0.f, 0.f, -1.f);
-			#else
-				L = V;
+			#if (LIGHT_USE_LAMBERT && ENABLE_LAMBERT_NORMAL_GRAD) || (LIGHT_USE_PHONG && ENABLE_PHONG_NORMAL_GRAD)
+				float dL_ddiffuse = 0.0f;
+				float dL_dspec    = 0.0f;
 			#endif
 
-				float l2 = L.x*L.x + L.y*L.y + L.z*L.z;
-				if (l2 > 1e-8f) { float inv = rsqrtf(l2); L.x*=inv; L.y*=inv; L.z*=inv; }
-
-			/*
-			// Spotlight direction: camera forward (so +Z) in camera space
-			const float3 spotDir = make_float3(0.f, 0.f, 1.f);
-
-			// cos angle between camera->surface and spotlight axis
-			float cosTheta = light_dir.x*spotDir.x + light_dir.y*spotDir.y + light_dir.z*spotDir.z;
-			
-			// cone angles (try to find one fitting the flashlight)
-			const float innerCos = 0.98; // about 11,5 degree 
-			const float outerCos = 0.92; // about 23,1 degree
-
-			// Smoothstep-ramp
-			float spot = 0.0f;
-			if (cosTheta >= innerCos) {
-				spot = 1.0f;
-			} else if (cosTheta <= outerCos) {
-				spot = 0.0f;
-			} else {
-				float t = (cosTheta - outerCos) / (innerCos - outerCos);
-				spot = t * t * (3.0f - 2.0f * t);
-			}
-			
-			// optional: make it “tighter / stronger”
-			// spot = spot * spot; // uncomment to sharpen
-			*/
-
-			ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
-
-			#if ENABLE_LAMBERT_SHADING
-			#   if USE_ABS_COS_SHADING
-					lambert = fabsf(ndotl);
-			#   else
-					lambert = fmaxf(ndotl, 0.0f);
-			#   endif
-			#else
-				lambert = 1.0f;
+			#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+				float dL_ddiffuse_shading = 0.0f; // for ambient gradient
 			#endif
 
-			diffuse_shading = (ambient + (1.0f - ambient) * lambert); // * spot;
+			const int global_id = collected_id[j];
 
-			#if ENABLE_PHONG_SPECULAR
-				// H = normalize(L + V)
-				float3 H = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
-				float h2 = H.x*H.x + H.y*H.y + H.z*H.z;
-				if (h2 > 1e-8f) {
-					float invh = rsqrtf(h2);
-					H.x *= invh; H.y *= invh; H.z *= invh;
+			for (int ch = 0; ch < C; ch++)
+			{
+				const float c = collected_colors[ch * BLOCK_SIZE + j];
+				const float dL_dchannel = dL_dpixel[ch];
 
-					float ndoth = fmaxf(n.x*H.x + n.y*H.y + n.z*H.z, 0.0f);
-					specular = powf(ndoth, PHONG_SHININESS);
-				} else {
-					specular = 0.0f;
-				}
-				spec_term = PHONG_KS * specular ; //* spot;
+				// ambient gradient
+				#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+					dL_ddiffuse_shading += dL_dchannel * (w * c);
 				#endif
+
+				// reccurence
+				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+				last_color[ch] = c;
+
+				float eff = Lout.diffuse_mul * c;
+				#if LIGHT_USE_PHONG
+					if (ch < 3) eff += Lout.spec_add;
+				#endif
+
+				accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
+				last_eff[ch] = eff;
+
+				dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
+
+				#if (LIGHT_USE_LAMBERT && ENABLE_LAMBERT_NORMAL_GRAD) || (LIGHT_USE_PHONG && ENABLE_PHONG_NORMAL_GRAD)
+					dL_ddiffuse += dL_dchannel * (w * c);
+
+					#if LIGHT_USE_PHONG
+						if (ch < 3) dL_dspec += dL_dchannel * w;
+					#endif
+				#endif
+
+				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+			}
+
+			// ---------- Ambient gradient (learned only) ----------
+			#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+			{
+				float d_diffuse_da = 1.0f - (Lout.lambert * Lout.spot);
+
+				#if LIGHT_ENERGY_COMP
+					d_diffuse_da *= (1.0f - LIGHT_PHONG_KS);
+				#endif
+
+				float a = Lout.ambient;
+				float da_draw = a * (1.0f - a);
+
+				dAmb += dL_ddiffuse_shading * d_diffuse_da * da_draw;
+			}
+			#endif
+
+			// ---------- Normal gradient approximation ----------
+			#if ( (LIGHT_USE_LAMBERT && ENABLE_LAMBERT_NORMAL_GRAD) || (LIGHT_USE_PHONG && ENABLE_PHONG_NORMAL_GRAD) )
+				if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f)
+				{
+					#if LIGHT_USE_LAMBERT && ENABLE_LAMBERT_NORMAL_GRAD
+						float a = 0.0f;
+						#if (LIGHT_AMBIENT_MODE == 2)
+							a = Lout.ambient;
+						#elif (LIGHT_AMBIENT_MODE == 1)
+							a = LIGHT_AMBIENT_FIXED;
+						#endif
+
+						float dL_dlambert = dL_ddiffuse * (1.0f - a) * Lout.spot;
+						#if LIGHT_ENERGY_COMP
+							dL_dlambert *= (1.0f - LIGHT_PHONG_KS);
+						#endif
+					#else
+						float dL_dlambert = 0.0f;
+					#endif
+
+					// convert dlambert to dndotl
+					float dL_dndotl = 0.0f;
+					#if LIGHT_USE_LAMBERT && ENABLE_LAMBERT_NORMAL_GRAD
+						#if LIGHT_LAMBERT_ABS
+							if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert;
+							else if (Lout.ndotl < 0.0f) dL_dndotl -= dL_dlambert;
+						#else
+							if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert; // max(ndotl,0) path
+						#endif
+					#endif
+
+					float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
+					light_dir = normalize_or_default(light_dir, make_float3(0.f,0.f,1.f));
+					float3 Lvec = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);
+					Lvec = normalize_or_default(Lvec, make_float3(0.f,0.f,-1.f));
+
+					if (dL_dndotl != 0.0f) {
+						atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndotl * Lvec.x);
+						atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndotl * Lvec.y);
+						atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndotl * Lvec.z);
+					}
+
+					// Specular ndoth path (approximate)
+					#if LIGHT_USE_PHONG && ENABLE_PHONG_NORMAL_GRAD
+					if (dL_dspec != 0.0f)
+					{
+						float3 n_unit = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
+						float3 Vvec = Lvec;
+
+						float3 Hh = make_float3(Lvec.x + Vvec.x, Lvec.y + Vvec.y, Lvec.z + Vvec.z);
+						Hh = normalize_or_default(Hh, make_float3(0.f,0.f,-1.f));
+
+						float ndoth = n_unit.x*Hh.x + n_unit.y*Hh.y + n_unit.z*Hh.z;
+						if (ndoth > 0.0f) {
+							float spec_deriv = LIGHT_PHONG_SHININESS * powf(ndoth, LIGHT_PHONG_SHININESS - 1.0f);
+
+							float dspec_dndoth = LIGHT_PHONG_KS * spec_deriv * Lout.spot;
+
+							#if (LIGHT_SPEC_GATING == 1)
+								if (Lout.ndotl <= 0.0f) dspec_dndoth = 0.0f;
+							#elif (LIGHT_SPEC_GATING == 2)
+								dspec_dndoth *= Lout.lambert;
+							#endif
+
+							float dL_dndoth = dL_dspec * dspec_dndoth;
+
+							atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndoth * Hh.x);
+							atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndoth * Hh.y);
+							atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndoth * Hh.z);
+						}
+					}
+					#endif
+				}
+				#endif
+
 			#else
-				lambert = 1.0f;
-				diffuse_shading = 1.0f;
-    			spec_term = 0.0f;
+				// No lighting, original 2DGS
+				const float w = alpha * T;
+				const float dchannel_dcolor = w;
+				float dL_dalpha = 0.0f;
+				const int global_id = collected_id[j];
+
+				for (int ch = 0; ch < C; ch++) {
+					const float c = collected_colors[ch * BLOCK_SIZE + j];
+					const float dL_dchannel = dL_dpixel[ch];
+
+					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+					last_color[ch] = c;
+
+					float eff = c; // diffuse_mul == 1
+					accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
+					last_eff[ch] = eff;
+
+					dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
+
+					atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				}
 			#endif
 
-			#if ENABLE_LAMBERT_SHADING
-			diffuse_shading *= (1.0f - PHONG_KS);  // light energy compensation
-			#endif
-			#if ENABLE_PHONG_SPECULAR
-			spec_term *= lambert;                 // make spec vanish at grazing/back-facing
-			#endif
-
-// --------------------------------------------------------------
-
-		const float w = alpha * T;
-		const float dchannel_dcolor = w * diffuse_shading;
-
-		// gradients w.r.t alpha
-		float dL_dalpha = 0.0f;
-
-		// accumulate dL/d(shading) if any normal grads are enabled
-		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
-			(ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD)
-			float dL_ddiffuse = 0.0f;
-			float dL_dspec = 0.0f;
-		#endif
-
-		float dL_ddiffuse_shading = 0.0f;
-
-		const int global_id = collected_id[j];
-
-		for (int ch = 0; ch < C; ch++)
-		{
-			const float c = collected_colors[ch * BLOCK_SIZE + j];
-			const float dL_dchannel = dL_dpixel[ch];
-
-			dL_ddiffuse_shading += dL_dchannel * (w * c);
-
-			accum_rec[ch] = last_alpha * last_color[ch]
-						+ (1.f - last_alpha) * accum_rec[ch];
-			last_color[ch] = c;
-
-			float eff = diffuse_shading * c;
-			#if ENABLE_PHONG_SPECULAR
-				if (ch < 3) eff += spec_term;
-			#endif
-
-			accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
-			last_eff[ch] = eff;
-
-			// shading factor appears in alpha gradient
-			dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
-
+			// ---------- Normal gradient from Lambert + Blinn-Phong --------------------
 			#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
 				(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
-				// diffuse part: I_ch += w * diffuse_shading * c
-				dL_ddiffuse += dL_dchannel * (w * c);
 
-				// spec part: I_rgb += w * spec_term   (white add)
-			#if ENABLE_PHONG_SPECULAR
-				if (ch < 3) dL_dspec += dL_dchannel * w;
-			#endif
-			#endif
+			if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f) {
 
-			// ∂I/∂c = w * shading
-			atomicAdd(&(dL_dcolors[global_id * C + ch]),
-					dchannel_dcolor * dL_dchannel);
-		}
-
-		float d_diffuse_d_ambient = (1.0f - lambert);
-		#if ENABLE_LAMBERT_SHADING
-		d_diffuse_d_ambient *= (1.0f - PHONG_KS);
-		#endif
-		float d_ambient_d_raw = ambient * (1.0f - ambient);
-		
-		atomicAdd(&dL_dambients[0], dL_ddiffuse_shading * d_diffuse_d_ambient * d_ambient_d_raw);
-
-		// ---------- Normal gradient from Lambert + Blinn-Phong --------------------
-		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
-			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
-
-		if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f) {
-
-		// --- Lambert path ---
-		#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
-			// diffuse_shading = (1-PHONG_KS) * (ambient + (1-ambient)*lambert)
-			float dL_dlambert = dL_ddiffuse * (1.0f - PHONG_KS) * (1.0f - ambient); // * spot;
-		#else
-			float dL_dlambert = 0.0f;
-		#endif
-
-		// plus: spec_term *= lambert  => spec contributes to lambert too
-		#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
-			// spec_term = lambert * (PHONG_KS * specular)
-			dL_dlambert += dL_dspec * (PHONG_KS * specular); //* spot;
-		#endif
-
-			float dL_dndotl = 0.0f;
+			// Lambert path
 			#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
-			#   if USE_ABS_COS_SHADING
-					if (ndotl > 0.0f)       dL_dndotl += dL_dlambert;
-					else if (ndotl < 0.0f)  dL_dndotl -= dL_dlambert;
-			#   else
-					if (ndotl > 0.0f)       dL_dndotl += dL_dlambert; // max(ndotl,0)
-			#   endif
+				float dL_dlambert = dL_ddiffuse * (1.0f - PHONG_KS) * (1.0f - ambient);
+			#else
+				float dL_dlambert = 0.0f;
 			#endif
 
-			if (dL_dndotl != 0.0f) {
-				atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndotl * L.x);
-				atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndotl * L.y);
-				atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndotl * L.z);
-			}
+			#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
+				dL_dlambert += dL_dspec * (PHONG_KS * specular);
+			#endif
 
-		// ---- Specular ndoth path ---------------------
-		#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
-			if (dL_dspec != 0.0f) {
-				float3 Hh = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
-				float h2 = Hh.x*Hh.x + Hh.y*Hh.y + Hh.z*Hh.z;
-				if (h2 > 1e-8f) {
-					float invh = rsqrtf(h2);
-					Hh.x *= invh; Hh.y *= invh; Hh.z *= invh;
+				float dL_dndotl = 0.0f;
+				#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
+				#   if USE_ABS_COS_SHADING
+						if (ndotl > 0.0f)       dL_dndotl += dL_dlambert;
+						else if (ndotl < 0.0f)  dL_dndotl -= dL_dlambert;
+				#   else
+						if (ndotl > 0.0f)       dL_dndotl += dL_dlambert; // max(ndotl,0)
+				#   endif
+				#endif
 
-					float ndoth = n.x*Hh.x + n.y*Hh.y + n.z*Hh.z;
-					if (ndoth > 0.0f) {
-						float spec_deriv = PHONG_SHININESS * powf(ndoth, PHONG_SHININESS - 1.0f);
+				if (dL_dndotl != 0.0f) {
+					atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndotl * L.x);
+					atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndotl * L.y);
+					atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndotl * L.z);
+				}
 
-						// spec_term = PHONG_KS * specular => d(spec_term)/d(ndoth) = PHONG_KS * spec_deriv
-						float dL_dndoth = dL_dspec * (lambert * PHONG_KS) * spec_deriv;
+			// Specular ndoth path 
+			#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
+				if (dL_dspec != 0.0f) {
+					float3 Hh = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
+					float h2 = Hh.x*Hh.x + Hh.y*Hh.y + Hh.z*Hh.z;
+					if (h2 > 1e-8f) {
+						float invh = rsqrtf(h2);
+						Hh.x *= invh; Hh.y *= invh; Hh.z *= invh;
 
-						atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndoth * Hh.x);
-						atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndoth * Hh.y);
-						atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndoth * Hh.z);
+						float ndoth = n.x*Hh.x + n.y*Hh.y + n.z*Hh.z;
+						if (ndoth > 0.0f) {
+							float spec_deriv = PHONG_SHININESS * powf(ndoth, PHONG_SHININESS - 1.0f);
+
+							float dL_dndoth = dL_dspec * (lambert * PHONG_KS) * spec_deriv;
+
+							atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndoth * Hh.x);
+							atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndoth * Hh.y);
+							atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndoth * Hh.z);
+						}
 					}
 				}
-			}
-		#endif // Phong normal grad
+			#endif // Phong normal grad
 
-		}
+			}
 
 		#endif
-		// --------------------------------------------------------------------------
 		// ========== END LAMBERT + PHONG SHADING (BACKWARD) ========================
 
             float dL_dz      = 0.0f;
@@ -696,6 +667,27 @@ renderCUDA(
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 		}
 	}
+
+	#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+	{
+		// write each threads contribution
+		amb_reduce[block.thread_rank()] = dAmb;
+		block.sync();
+
+		// reduce within block
+		for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1)
+		{
+			if (block.thread_rank() < stride)
+				amb_reduce[block.thread_rank()] += amb_reduce[block.thread_rank() + stride];
+			block.sync();
+		}
+
+		// store one atomic per block
+		if (block.thread_rank() == 0)
+			atomicAdd(&dL_dambients[0], amb_reduce[0]);
+	}
+	#endif
+	
 }
 
 __device__ void compute_transmat_aabb(

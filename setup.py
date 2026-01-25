@@ -25,6 +25,7 @@ setup(
                 "cuda_rasterizer/rasterizer_impl.cu",
                 "cuda_rasterizer/forward.cu",
                 "cuda_rasterizer/backward.cu",
+                "build_info.cpp",
                 "rasterize_points.cu",
                 "ext.cpp",
             ],
