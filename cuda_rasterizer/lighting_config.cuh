@@ -64,6 +64,10 @@
 #endif
 
 // ------------------ Phong parameters ------------------
+#ifndef LIGHT_PHONG_KS_MODE
+#define LIGHT_PHONG_KS_MODE 1   // 1 to learn ks, 0 hard-coded
+#endif
+
 #ifndef LIGHT_PHONG_KS
 #define LIGHT_PHONG_KS 0.10f
 #endif
@@ -77,7 +81,7 @@
 // 1 = backface gate only: spec = 0 if ndotl <= 0
 // 2 = scale by lambert
 #ifndef LIGHT_SPEC_GATING
-#define LIGHT_SPEC_GATING 1
+#define LIGHT_SPEC_GATING 2
 #endif
 
 // ------------------ Energy compensation ------------------

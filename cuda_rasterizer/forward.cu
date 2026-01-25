@@ -265,6 +265,7 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ ambients,
+	const float* __restrict__ kspecular,
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
@@ -402,7 +403,7 @@ renderCUDA(
 
 			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular);
 
 				w_diff = w * Lout.diffuse_mul;
 
@@ -439,11 +440,9 @@ renderCUDA(
 
 			// Specular added to RGB
 			#if LIGHT_USE_PHONG
-			if (CHANNELS >= 3) {
-				C[0] += w_spec;
-				C[1] += w_spec;
-				C[2] += w_spec;
-			}
+				C[0] += w_spec * features[collected_id[j] * CHANNELS + 0];
+				C[1] += w_spec * features[collected_id[j] * CHANNELS + 1];
+				C[2] += w_spec * features[collected_id[j] * CHANNELS + 2];
 			#endif
 
 			T = test_T;
@@ -486,6 +485,7 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float* ambients,
+	const float* kspecular,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
@@ -503,6 +503,7 @@ void FORWARD::render(
 		means2D,
 		colors,
 		ambients,
+		kspecular,
 		transMats,
 		depths,
 		normal_opacity,

@@ -3,11 +3,15 @@
 
 struct LightingOut {
     float diffuse_mul; // multiplied to base color
+    float diffuse_base; // diffuse without energy compensation
     float spec_add;    // additive spec
     float lambert;     // lambert tern
     float ndotl;       // n*L
     float spot;        // spotlight factor
     float ambient;     // ambient value
+    float kspec;       // specular factor
+    float dkspecular;  // derivative of spec factor
+    float spec_base;   // spec without ks
 };
 
 __device__ __forceinline__ float3 apply_norm_jacobian(float3 n_raw, float3 g_unit)
@@ -88,7 +92,18 @@ __device__ __forceinline__ float ambient_value(const float* __restrict__ ambient
 #endif
 }
 
-// Spotlight axis: camera forward (+Z).
+__device__ __forceinline__
+float kspec_value(const float* kspecs)
+{
+#if (LIGHT_PHONG_KS_MODE == 1)
+    // learned scalar value between [0,1]
+    return sigmoidf_stable(kspecs[0]);
+#else
+    return LIGHT_PHONG_KS;
+#endif
+}
+
+// Spotlight axis: camera forward (+Z)
 __device__ __forceinline__ float spotlight_factor(const float3& light_dir_cam_to_surf) {
 #if LIGHT_USE_SPOT
     const float3 axis = make_float3(0.f, 0.f, 1.f);
@@ -113,7 +128,8 @@ LightingOut eval_lighting(
     int W, int H,
     float focal_x, float focal_y,
     float3 n_raw,
-    const float* __restrict__ ambients
+    const float* __restrict__ ambients,
+    const float* __restrict__ kspecs
 ) {
     LightingOut o;
     o.diffuse_mul = 1.0f;
@@ -157,9 +173,11 @@ LightingOut eval_lighting(
 
 #if LIGHT_USE_LAMBERT
     float diffuse = a + (1.0f - a) * lambert * spot;
+    o.diffuse_base = diffuse;
 #else
-    // Phong-only: keeping a neutral base
+    // Phong-only: base color
     float diffuse = 1.0f;
+    o.diffuse_base = 1.0f;
 #endif
 
 #if LIGHT_USE_PHONG
@@ -168,22 +186,39 @@ LightingOut eval_lighting(
     float ndoth = fmaxf(n.x*Hh.x + n.y*Hh.y + n.z*Hh.z, 0.0f);
     float specular = (ndoth > 0.0f) ? powf(ndoth, LIGHT_PHONG_SHININESS) : 0.0f;
 
-    float spec = LIGHT_PHONG_KS * specular * spot;
+    float ks = kspec_value(kspecs);
 
-  #if (LIGHT_SPEC_GATING == 1)
-    if (ndotl <= 0.0f) spec = 0.0f;
-  #elif (LIGHT_SPEC_GATING == 2)
-    spec *= lambert;
-  #endif
+    float dkspecular = 0.0f;
+    #if (LIGHT_PHONG_KS_MODE == 1)
+        dkspecular = ks * (1.0f - ks);
+    #endif
+
+    float spec_base = specular * spot;
+
+    #if (LIGHT_SPEC_GATING == 1)
+            if (ndotl <= 0.0f) spec_base = 0.0f;
+        #elif (LIGHT_SPEC_GATING == 2)
+            spec_base *= lambert;
+        #endif
+
+    float spec = ks * spec_base;
+
+    // energy compensation
+    #if LIGHT_ENERGY_COMP
+        #if LIGHT_USE_LAMBERT
+            diffuse *= (1.0f - ks);
+        #endif
+    #endif
+
+    o.kspec = ks;
+    o.dkspecular = dkspecular;
+    o.spec_base = spec_base;
 
 #else
     float spec = 0.0f;
-#endif
-
-#if LIGHT_ENERGY_COMP
-  #if LIGHT_USE_LAMBERT
-    diffuse *= (1.0f - LIGHT_PHONG_KS);
-  #endif
+    o.kspec = 0.0f;
+    o.dkspecular = 0.0f;
+    o.spec_base = 0.0f;
 #endif
 
     o.diffuse_mul = diffuse;

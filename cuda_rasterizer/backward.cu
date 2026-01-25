@@ -154,6 +154,7 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ colors,
 	const float* __restrict__ ambients,
+	const float* __restrict__ kspecular,
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
@@ -164,7 +165,8 @@ renderCUDA(
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_dambients)
+	float* __restrict__ dL_dambients,
+	float* __restrict__ dL_dkspecular)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -253,11 +255,13 @@ renderCUDA(
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
-	// per-thread accumulator for ambient gradient
+	// per-thread accumulators
 	float dAmb = 0.0f;
+	float dKs = 0.0f;
 
-	// shared buffer for block reduction
+	// shared buffers for block reduction
 	__shared__ float amb_reduce[BLOCK_SIZE];
+	__shared__ float ks_reduce[BLOCK_SIZE];
 
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -338,15 +342,13 @@ renderCUDA(
 			#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular);
 
 				const float w = alpha * T;
 				const float dchannel_dcolor = w * Lout.diffuse_mul;
 
-				#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
-					float dL_ddiffuse = 0.0f;
-					float dL_dspec    = 0.0f;
-				#endif
+				float dL_ddiffuse = 0.0f;
+				float dL_dspec    = 0.0f;
 
 				#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
 					float dL_ddiffuse_shading = 0.0f; // for ambient gradient
@@ -391,7 +393,7 @@ renderCUDA(
 				float d_diffuse_da = 1.0f - (Lout.lambert * Lout.spot);
 
 				#if LIGHT_ENERGY_COMP
-					d_diffuse_da *= (1.0f - LIGHT_PHONG_KS);
+					d_diffuse_da *= (1.0f - Lout.kspec);
 				#endif
 
 				float a = Lout.ambient;
@@ -401,10 +403,28 @@ renderCUDA(
 			}
 			#endif
 
+			// ----- kspecular gradient (learned scalar) -----
+			#if LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
+			{
+				const float dL_dspec_add = dL_dspec;
+				const float dL_ddiffuse_mul = dL_ddiffuse;
+				const float dspecadd_dks = Lout.spec_base;
+
+				// diffuse energy compensation term
+				float ddiffmul_dks = 0.0f;
+				#if LIGHT_ENERGY_COMP && LIGHT_USE_LAMBERT
+					ddiffmul_dks = -Lout.diffuse_base;
+				#endif
+
+				const float dL_dks = dL_dspec_add * dspecadd_dks + dL_ddiffuse_mul * ddiffmul_dks;
+
+				dKs += dL_dks * Lout.dkspecular;
+			}
+			#endif
+
 			// ---------- Normal gradient approximation ----------
 			if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f)
 			{
-				// Lambert => dL/dndotl
 				float dL_dndotl = 0.0f;
 
 				#if LIGHT_USE_LAMBERT
@@ -419,7 +439,7 @@ renderCUDA(
 					float dL_dlambert = dL_ddiffuse * (1.0f - a) * Lout.spot;
 
 					#if LIGHT_ENERGY_COMP
-						dL_dlambert *= (1.0f - LIGHT_PHONG_KS);
+						dL_dlambert *= (1.0f - Lout.kspec);
 					#endif
 
 					#if LIGHT_LAMBERT_ABS
@@ -442,7 +462,7 @@ renderCUDA(
 					atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndotl * Lvec.z);
 				}
 
-				// Specular ndoth path (approximate)
+				// Specular ndoth path
 				#if LIGHT_USE_PHONG
 				if (dL_dspec != 0.0f)
 				{
@@ -456,7 +476,7 @@ renderCUDA(
 					if (ndoth > 0.0f) {
 						float spec_deriv = LIGHT_PHONG_SHININESS * powf(ndoth, LIGHT_PHONG_SHININESS - 1.0f);
 
-						float dspec_dndoth = LIGHT_PHONG_KS * spec_deriv * Lout.spot;
+						float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot;
 
 						#if (LIGHT_SPEC_GATING == 1)
 							if (Lout.ndotl <= 0.0f) dspec_dndoth = 0.0f;
@@ -624,6 +644,22 @@ renderCUDA(
 	}
 	#endif
 
+	#if LIGHT_ENABLE_BWD && LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
+		{
+			ks_reduce[block.thread_rank()] = dKs;
+			block.sync();
+
+			for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1)
+			{
+				if (block.thread_rank() < stride)
+					ks_reduce[block.thread_rank()] += ks_reduce[block.thread_rank() + stride];
+				block.sync();
+			}
+
+			if (block.thread_rank() == 0)
+				atomicAdd(&dL_dkspecular[0], ks_reduce[0]);
+		}
+	#endif
 }
 
 __device__ void compute_transmat_aabb(
@@ -879,6 +915,7 @@ void BACKWARD::render(
 	const float4* normal_opacity,
 	const float* colors,
 	const float* ambients,
+	const float* kspecular,
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
@@ -890,7 +927,8 @@ void BACKWARD::render(
 	float* dL_dnormal3D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dambient)
+	float* dL_dambient,
+	float* dL_dkspecular)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -903,6 +941,7 @@ void BACKWARD::render(
 		transMats,
 		colors,
 		ambients,
+		kspecular,
 		depths,
 		final_Ts,
 		n_contrib,
@@ -913,6 +952,7 @@ void BACKWARD::render(
 		dL_dnormal3D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_dambient
+		dL_dambient,
+		dL_dkspecular
 		);
 }

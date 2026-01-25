@@ -25,6 +25,7 @@ def rasterize_gaussians(
     colors_precomp,
     opacities,
     ambients,
+    kspecular,
     scales,
     rotations,
     cov3Ds_precomp,
@@ -37,6 +38,7 @@ def rasterize_gaussians(
         colors_precomp,
         opacities,
         ambients,
+        kspecular,
         scales,
         rotations,
         cov3Ds_precomp,
@@ -53,6 +55,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         colors_precomp,
         opacities,
         ambients,
+        kspecular,
         scales,
         rotations,
         cov3Ds_precomp,
@@ -66,6 +69,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             colors_precomp,
             opacities,
             ambients,
+            kspecular,
             scales,
             rotations,
             raster_settings.scale_modifier,
@@ -98,7 +102,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, ambients, geomBuffer, binningBuffer, imgBuffer)
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, ambients, kspecular, geomBuffer, binningBuffer, imgBuffer)
         return color, radii, depth
 
     @staticmethod
@@ -107,7 +111,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
-        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, ambients, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, ambients, kspecular, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -115,6 +119,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 radii, 
                 colors_precomp, 
                 ambients,
+                kspecular,
                 scales, 
                 rotations, 
                 raster_settings.scale_modifier, 
@@ -138,13 +143,13 @@ class _RasterizeGaussians(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                grad_means2D, grad_colors_precomp, grad_opacities, grad_ambients, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+                grad_means2D, grad_colors_precomp, grad_opacities, grad_ambients, grad_kspecular, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-             grad_means2D, grad_colors_precomp, grad_opacities, grad_ambients, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+             grad_means2D, grad_colors_precomp, grad_opacities, grad_ambients, grad_kspecular, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
 
         grads = (
             grad_means3D,
@@ -153,6 +158,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_colors_precomp,
             grad_opacities,
             grad_ambients,
+            grad_kspecular,
             grad_scales,
             grad_rotations,
             grad_cov3Ds_precomp,
@@ -191,7 +197,7 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, ambients, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(self, means3D, means2D, opacities, ambients, kspecular, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
         
         raster_settings = self.raster_settings
 
@@ -222,9 +228,10 @@ class GaussianRasterizer(nn.Module):
             colors_precomp,
             opacities,
             ambients,
+            kspecular,
             scales, 
             rotations,
             cov3D_precomp,
-            raster_settings, 
+            raster_settings,
         )
 
