@@ -13,6 +13,7 @@ from typing import NamedTuple
 import torch.nn as nn
 import torch
 from . import _C
+from utils.lighting_config import pack_lighting_cfg
 
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
@@ -29,7 +30,7 @@ def rasterize_gaussians(
     scales,
     rotations,
     cov3Ds_precomp,
-    raster_settings,
+    raster_settings
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -42,7 +43,7 @@ def rasterize_gaussians(
         scales,
         rotations,
         cov3Ds_precomp,
-        raster_settings,
+        raster_settings
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -59,7 +60,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         scales,
         rotations,
         cov3Ds_precomp,
-        raster_settings,
+        raster_settings
     ):
 
         # Restructure arguments the way that the C++ lib expects them
@@ -90,6 +91,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Invoke C++/CUDA rasterizer
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
+
             try:
                 num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
             except Exception as ex:
@@ -115,7 +117,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
-                means3D, 
+                means3D,
                 radii, 
                 colors_precomp, 
                 ambients,
@@ -232,6 +234,6 @@ class GaussianRasterizer(nn.Module):
             scales, 
             rotations,
             cov3D_precomp,
-            raster_settings,
+            raster_settings
         )
 

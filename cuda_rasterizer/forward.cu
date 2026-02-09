@@ -12,6 +12,7 @@
 #include "forward.h"
 #include "auxiliary.h"
 #include "lighting.cuh"
+#include "lighting_config.cuh"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -288,6 +289,11 @@ renderCUDA(
 	bool inside = pix.x < W&& pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
+	
+	const LightingConfig& cfg = get_lighting_cfg();
+
+	const bool useLambert = light_use_lambert(cfg);
+	const bool usePhong   = light_use_phong(cfg);
 
 	// Load start/end range of IDs to process in bit sorted list.
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -396,21 +402,24 @@ renderCUDA(
 				done = true;
 				continue;
 			}
+
 			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
 			float w      = alpha * T;
 			float w_diff = w;        // default, no lighting
 			float w_spec = 0.0f;     // default, no spec
-
-			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+			float shininess = 8.0f; // TODO remove when learnable
+			
+			if (cfg.enable_fwd && (useLambert || usePhong)) {
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular);
+
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular, shininess, cfg);
 
 				w_diff = w * Lout.diffuse_mul;
 
-				#if LIGHT_USE_PHONG
+				if (usePhong) {
 					w_spec = w * Lout.spec_add;
-				#endif
-			#endif
+				}
+			}
 
 #if RENDER_AXUTILITY
 			// Render depth distortion map
@@ -439,11 +448,8 @@ renderCUDA(
 			}
 
 			// Specular added to RGB
-			#if LIGHT_USE_PHONG
-				C[0] += w_spec * features[collected_id[j] * CHANNELS + 0];
-				C[1] += w_spec * features[collected_id[j] * CHANNELS + 1];
-				C[2] += w_spec * features[collected_id[j] * CHANNELS + 2];
-			#endif
+			for (i = 0; i < NUM_CHANNELS; i++)
+				C[i] += w_spec * features[collected_id[i] * CHANNELS + i];
 
 			T = test_T;
 

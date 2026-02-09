@@ -139,7 +139,6 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
-
 // Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
@@ -184,6 +183,11 @@ renderCUDA(
 
 	bool done = !inside;
 	int toDo = range.y - range.x;
+
+	const LightingConfig& cfg = get_lighting_cfg();
+
+	const bool useLambert = light_use_lambert(cfg);
+	const bool usePhong   = light_use_phong(cfg);
 
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
@@ -339,10 +343,14 @@ renderCUDA(
 			float dL_dalpha = 0.0f;
 			const int global_id = collected_id[j];
 
-			#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+			float shininess = 8.0f; // TODO remove when learnable
+
+			if (cfg.enable_bwd && (useLambert || usePhong)) {
 
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular, shininess, cfg);
+
+				float shiny = cfg.phong_shininess;
 
 				const float w = alpha * T;
 				const float dchannel_dcolor = w * Lout.diffuse_mul;
@@ -350,9 +358,7 @@ renderCUDA(
 				float dL_ddiffuse = 0.0f;
 				float dL_dspec    = 0.0f;
 
-				#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
-					float dL_ddiffuse_shading = 0.0f; // for ambient gradient
-				#endif
+				float dL_ddiffuse_shading = 0.0f; // for ambient gradient when learned
 
 				for (int ch = 0; ch < C; ch++)
 				{
@@ -360,18 +366,16 @@ renderCUDA(
 					const float dL_dchannel = dL_dpixel[ch];
 
 					// ambient gradient
-					#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+					if (useLambert && cfg.ambient_mode == AMBIENT_LEARN) {
 						dL_ddiffuse_shading += dL_dchannel * (w * c);
-					#endif
+					}
 
 					// reccurence
 					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 					last_color[ch] = c;
 
 					float eff = Lout.diffuse_mul * c;
-					#if LIGHT_USE_PHONG
-						if (ch < 3) eff += Lout.spec_add;
-					#endif
+					if (usePhong && ch < 3) eff += Lout.spec_add;
 
 					accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
 					last_eff[ch] = eff;
@@ -380,76 +384,62 @@ renderCUDA(
 
 					// gradients needed for spec path
 					dL_ddiffuse += dL_dchannel * (w * c);
-					#if LIGHT_USE_PHONG
-						if (ch < 3) dL_dspec += dL_dchannel * w;
-					#endif
+					if (usePhong && ch < 3) dL_dspec += dL_dchannel * w;
 
 					atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 				}
 
-			// ---------- Ambient gradient (learned only) ----------
-			#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
-			{
-				float d_diffuse_da = 1.0f - (Lout.lambert * Lout.spot);
+				// ---------- Ambient gradient (learned only) ----------
+				if (useLambert && cfg.ambient_mode == AMBIENT_LEARN) {
+					float d_diffuse_da = 1.0f - (Lout.lambert * Lout.spot);
 
-				#if LIGHT_ENERGY_COMP
-					d_diffuse_da *= (1.0f - Lout.kspec);
-				#endif
+					if (cfg.energy_comp == ENERGY_COMP_ON) {
+						d_diffuse_da *= (1.0f - Lout.kspec);
+					}
 
-				float a = Lout.ambient;
-				float da_draw = a * (1.0f - a);
+					float a = Lout.ambient;
+					float da_draw = a * (1.0f - a);
 
-				dAmb += dL_ddiffuse_shading * d_diffuse_da * da_draw;
-			}
-			#endif
-
-			// ----- kspecular gradient (learned scalar) -----
-			#if LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
-			{
-				const float dL_dspec_add = dL_dspec;
-				const float dL_ddiffuse_mul = dL_ddiffuse;
-				const float dspecadd_dks = Lout.spec_base;
-
-				// diffuse energy compensation term
-				float ddiffmul_dks = 0.0f;
-				#if LIGHT_ENERGY_COMP && LIGHT_USE_LAMBERT
-					ddiffmul_dks = -Lout.diffuse_base;
-				#endif
-
-				const float dL_dks = dL_dspec_add * dspecadd_dks + dL_ddiffuse_mul * ddiffmul_dks;
-
-				dKs += dL_dks * Lout.dkspecular;
-			}
-			#endif
-
-			// ---------- Normal gradient approximation ----------
-			if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f)
-			{
-				float dL_dndotl = 0.0f;
-
-				#if LIGHT_USE_LAMBERT
-				{
-					float a = 0.0f;
-					#if (LIGHT_AMBIENT_MODE == 2)
-						a = Lout.ambient;
-					#elif (LIGHT_AMBIENT_MODE == 1)
-						a = LIGHT_AMBIENT_FIXED;
-					#endif
-
-					float dL_dlambert = dL_ddiffuse * (1.0f - a) * Lout.spot;
-
-					#if LIGHT_ENERGY_COMP
-						dL_dlambert *= (1.0f - Lout.kspec);
-					#endif
-
-					#if LIGHT_LAMBERT_ABS
-						if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert;
-						else if (Lout.ndotl < 0.0f) dL_dndotl -= dL_dlambert;
-					#else
-						if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert; // max(ndotl,0)
-					#endif
+					dAmb += dL_ddiffuse_shading * d_diffuse_da * da_draw;
 				}
-				#endif
+
+				// ----- kspecular gradient (learned scalar) -----
+				if (usePhong && cfg.phong_ks_mode == KS_LEARN) {
+					const float dL_dspec_add = dL_dspec;
+					const float dL_ddiffuse_mul = dL_ddiffuse;
+
+					const float dspecadd_dks = Lout.spec_base;
+
+					float ddiffmul_dks = 0.0f;
+					if (cfg.energy_comp == ENERGY_COMP_ON && useLambert) {
+						ddiffmul_dks = -Lout.diffuse_base;
+					}
+
+					const float dL_dks = dL_dspec_add * dspecadd_dks + dL_ddiffuse_mul * ddiffmul_dks;
+					dKs += dL_dks * Lout.dkspecular;
+				}
+
+				// ---------- Normal gradient approximation ----------
+				float dL_dndotl = 0.0f;
+				if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f)
+				{
+
+					if (useLambert) {
+						float a = Lout.ambient;
+						float dL_dlambert = dL_ddiffuse * (1.0f - a) * Lout.spot;
+
+						if (cfg.energy_comp == ENERGY_COMP_ON) {
+							dL_dlambert *= (1.0f - Lout.kspec);
+						}
+
+						if (cfg.lambert_mode == LAMBERT_ABS) {
+							if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert;
+							else if (Lout.ndotl < 0.0f) dL_dndotl -= dL_dlambert;
+						} else {
+							if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert;
+						}
+					}
+				}
 
 				float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
 				light_dir = normalize_or_default(light_dir, make_float3(0.f,0.f,1.f));
@@ -463,8 +453,7 @@ renderCUDA(
 				}
 
 				// Specular ndoth path
-				#if LIGHT_USE_PHONG
-				if (dL_dspec != 0.0f)
+				if (usePhong && dL_dspec != 0.0f)
 				{
 					float3 n_unit = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
 					float3 Vvec = Lvec;
@@ -474,15 +463,16 @@ renderCUDA(
 
 					float ndoth = n_unit.x*Hh.x + n_unit.y*Hh.y + n_unit.z*Hh.z;
 					if (ndoth > 0.0f) {
-						float spec_deriv = LIGHT_PHONG_SHININESS * powf(ndoth, LIGHT_PHONG_SHININESS - 1.0f);
+						float shiny = shininess_value(shininess, cfg);
+						float spec_deriv = shiny * powf(ndoth, shiny - 1.0f);
 
 						float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot;
 
-						#if (LIGHT_SPEC_GATING == 1)
+						if (cfg.spec_gating == SPEC_GATING_BACKFACE) {
 							if (Lout.ndotl <= 0.0f) dspec_dndoth = 0.0f;
-						#elif (LIGHT_SPEC_GATING == 2)
+						} else if (cfg.spec_gating == SPEC_GATING_LAMBERTSCALE) {
 							dspec_dndoth *= Lout.lambert;
-						#endif
+						}
 
 						float dL_dndoth = dL_dspec * dspec_dndoth;
 
@@ -491,10 +481,8 @@ renderCUDA(
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndoth * Hh.z);
 					}
 				}
-				#endif
-			}
 
-			#else
+			} else {
 				// No lighting, original 2DGS
 				const float w = alpha * T;
 				const float dchannel_dcolor = w;
@@ -514,118 +502,116 @@ renderCUDA(
 
 					atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 				}
-			#endif
+			}
 
 		// ========== END LAMBERT + PHONG SHADING (BACKWARD) ========================
 
-            float dL_dz      = 0.0f;
-            float dL_dweight = 0;
+		float dL_dz      = 0.0f;
+		float dL_dweight = 0;
 
 #if RENDER_AXUTILITY
-			const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
-			const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * c_d * c_d);
-			if (contributor == median_contributor-1) {
-				dL_dz += dL_dmedian_depth;
-				// dL_dweight += dL_dmax_dweight;
-			}
-#if DETACH_WEIGHT 
-			// if not detached weight, sometimes 
-			// it will bia toward creating extragated 2D Gaussians near front
-			dL_dweight += 0;
-#else
-			dL_dweight += (final_D2 + m_d * m_d * final_A - 2 * m_d * final_D) * dL_dreg;
-#endif
-			dL_dalpha += dL_dweight - last_dL_dT;
-			// propagate the current weight W_{i} to next weight W_{i-1}
-			last_dL_dT = dL_dweight * alpha + (1 - alpha) * last_dL_dT;
-			const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
-			dL_dz += dL_dmd * dmd_dd;
-
-			// Propagate gradients w.r.t ray-splat depths
-			accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
-			last_depth = c_d;
-			dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
-			// Propagate gradients w.r.t. color ray-splat alphas
-			accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
-			dL_dalpha += (1 - accum_alpha_rec) * dL_daccum;
-
-			// Propagate gradients to per-Gaussian normals
-			for (int ch = 0; ch < 3; ch++) {
-				accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
-				last_normal[ch] = normal[ch];
-				dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
-				atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
-			}
-#endif
-
-			dL_dalpha *= T;
-			// Update last alpha (to be used in the next iteration)
-			last_alpha = alpha;
-
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
-
-
-			// Helpful reusable temporary variables
-			const float dL_dG = nor_o.w * dL_dalpha;
-#if RENDER_AXUTILITY
-			dL_dz += alpha * T * dL_ddepth; 
-#endif
-
-			if (rho3d <= rho2d) {
-				// Update gradients w.r.t. covariance of Gaussian 3x3 (T)
-				const float2 dL_ds = {
-					dL_dG * -G * s.x + dL_dz * Tw.x,
-					dL_dG * -G * s.y + dL_dz * Tw.y
-				};
-				const float3 dz_dTw = {s.x, s.y, 1.0};
-				const float dsx_pz = dL_ds.x / p.z;
-				const float dsy_pz = dL_ds.y / p.z;
-				const float3 dL_dp = {dsx_pz, dsy_pz, -(dsx_pz * s.x + dsy_pz * s.y)};
-				const float3 dL_dk = cross(l, dL_dp);
-				const float3 dL_dl = cross(dL_dp, k);
-
-				const float3 dL_dTu = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
-				const float3 dL_dTv = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
-				const float3 dL_dTw = {
-					pixf.x * dL_dk.x + pixf.y * dL_dl.x + dL_dz * dz_dTw.x, 
-					pixf.x * dL_dk.y + pixf.y * dL_dl.y + dL_dz * dz_dTw.y, 
-					pixf.x * dL_dk.z + pixf.y * dL_dl.z + dL_dz * dz_dTw.z};
-
-
-				// Update gradients w.r.t. 3D covariance (3x3 matrix)
-				atomicAdd(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
-			} else {
-				// // Update gradients w.r.t. center of Gaussian 2D mean position
-				const float dG_ddelx = -G * FilterInvSquare * d.x;
-				const float dG_ddely = -G * FilterInvSquare * d.y;
-				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
-				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
-				// // Propagate the gradients of depth
-				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  s.x * dL_dz);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  s.y * dL_dz);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz);
-			}
-
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+		const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
+		const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * c_d * c_d);
+		if (contributor == median_contributor-1) {
+			dL_dz += dL_dmedian_depth;
+			// dL_dweight += dL_dmax_dweight;
 		}
+#if DETACH_WEIGHT 
+		// if not detached weight, sometimes 
+		// it will bia toward creating extragated 2D Gaussians near front
+		dL_dweight += 0;
+#else
+		dL_dweight += (final_D2 + m_d * m_d * final_A - 2 * m_d * final_D) * dL_dreg;
+#endif
+		dL_dalpha += dL_dweight - last_dL_dT;
+		// propagate the current weight W_{i} to next weight W_{i-1}
+		last_dL_dT = dL_dweight * alpha + (1 - alpha) * last_dL_dT;
+		const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
+		dL_dz += dL_dmd * dmd_dd;
+
+		// Propagate gradients w.r.t ray-splat depths
+		accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
+		last_depth = c_d;
+		dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
+		// Propagate gradients w.r.t. color ray-splat alphas
+		accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
+		dL_dalpha += (1 - accum_alpha_rec) * dL_daccum;
+
+		// Propagate gradients to per-Gaussian normals
+		for (int ch = 0; ch < 3; ch++) {
+			accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
+			last_normal[ch] = normal[ch];
+			dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
+			atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
+		}
+#endif
+
+		dL_dalpha *= T;
+		// Update last alpha (to be used in the next iteration)
+		last_alpha = alpha;
+
+		// Account for fact that alpha also influences how much of
+		// the background color is added if nothing left to blend
+		float bg_dot_dpixel = 0;
+		for (int i = 0; i < C; i++)
+			bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+		dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+
+		// Helpful reusable temporary variables
+		const float dL_dG = nor_o.w * dL_dalpha;
+#if RENDER_AXUTILITY
+		dL_dz += alpha * T * dL_ddepth; 
+#endif
+
+		if (rho3d <= rho2d) {
+			// Update gradients w.r.t. covariance of Gaussian 3x3 (T)
+			const float2 dL_ds = {
+				dL_dG * -G * s.x + dL_dz * Tw.x,
+				dL_dG * -G * s.y + dL_dz * Tw.y
+			};
+			const float3 dz_dTw = {s.x, s.y, 1.0};
+			const float dsx_pz = dL_ds.x / p.z;
+			const float dsy_pz = dL_ds.y / p.z;
+			const float3 dL_dp = {dsx_pz, dsy_pz, -(dsx_pz * s.x + dsy_pz * s.y)};
+			const float3 dL_dk = cross(l, dL_dp);
+			const float3 dL_dl = cross(dL_dp, k);
+
+			const float3 dL_dTu = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
+			const float3 dL_dTv = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
+			const float3 dL_dTw = {
+				pixf.x * dL_dk.x + pixf.y * dL_dl.x + dL_dz * dz_dTw.x, 
+				pixf.x * dL_dk.y + pixf.y * dL_dl.y + dL_dz * dz_dTw.y, 
+				pixf.x * dL_dk.z + pixf.y * dL_dl.z + dL_dz * dz_dTw.z};
+
+
+			// Update gradients w.r.t. 3D covariance (3x3 matrix)
+			atomicAdd(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
+		} else {
+			// // Update gradients w.r.t. center of Gaussian 2D mean position
+			const float dG_ddelx = -G * FilterInvSquare * d.x;
+			const float dG_ddely = -G * FilterInvSquare * d.y;
+			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
+			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
+			// // Propagate the gradients of depth
+			atomicAdd(&dL_dtransMat[global_id * 9 + 6],  s.x * dL_dz);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 7],  s.y * dL_dz);
+			atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz);
+		}
+
+		// Update gradients w.r.t. opacity of the Gaussian
+		atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 	}
 
-	#if LIGHT_ENABLE_BWD && LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
-	{
+	if (cfg.enable_bwd && useLambert && (cfg.ambient_mode == AMBIENT_LEARN)) {
 		// write each threads contribution
 		amb_reduce[block.thread_rank()] = dAmb;
 		block.sync();
@@ -642,24 +628,22 @@ renderCUDA(
 		if (block.thread_rank() == 0)
 			atomicAdd(&dL_dambients[0], amb_reduce[0]);
 	}
-	#endif
 
-	#if LIGHT_ENABLE_BWD && LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
+	if (cfg.enable_bwd && usePhong && (cfg.phong_ks_mode == KS_LEARN)) {
+		ks_reduce[block.thread_rank()] = dKs;
+		block.sync();
+
+		for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1)
 		{
-			ks_reduce[block.thread_rank()] = dKs;
+			if (block.thread_rank() < stride)
+				ks_reduce[block.thread_rank()] += ks_reduce[block.thread_rank() + stride];
 			block.sync();
-
-			for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1)
-			{
-				if (block.thread_rank() < stride)
-					ks_reduce[block.thread_rank()] += ks_reduce[block.thread_rank() + stride];
-				block.sync();
-			}
-
-			if (block.thread_rank() == 0)
-				atomicAdd(&dL_dkspecular[0], ks_reduce[0]);
 		}
-	#endif
+
+		if (block.thread_rank() == 0)
+			atomicAdd(&dL_dkspecular[0], ks_reduce[0]);
+	}
+}
 }
 
 __device__ void compute_transmat_aabb(

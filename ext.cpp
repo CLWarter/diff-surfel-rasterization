@@ -12,10 +12,12 @@
 #include <torch/extension.h>
 #include "rasterize_points.h"
 #include "build_info.h"
+#include "cuda_rasterizer/lighting_config_upload.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
   m.def("mark_visible", &markVisible);
   m.def("get_lighting_build_info", &get_lighting_build_info, "Get lighting build info");
-}
+  m.def("set_lighting_config", &SetLightingConfigCUDA, "Upload lighting config to CUDA constant memory");
+  }

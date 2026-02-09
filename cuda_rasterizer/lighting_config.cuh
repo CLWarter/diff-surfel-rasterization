@@ -1,118 +1,122 @@
 #pragma once
+#include <stdint.h>
 
-// ------------------ Master switches (compile-time) ------------------
+// ------------------ MODES ------------------------
+
+// ------------------ Light modes ------------------
 // Allow testing forward-only / backward-only lighting
-#ifndef LIGHT_ENABLE_FWD
-#define LIGHT_ENABLE_FWD 1
-#endif
-
-#ifndef LIGHT_ENABLE_BWD
-#define LIGHT_ENABLE_BWD 1
-#endif
-
-// ------------------ Lighting mode presets ------------------
-// Pick just one
-#ifndef LIGHT_MODE_NO_LIGHTING
-#define LIGHT_MODE_NO_LIGHTING 0
-#endif
-#ifndef LIGHT_MODE_LAMBERT_ONLY
-#define LIGHT_MODE_LAMBERT_ONLY 0
-#endif
-#ifndef LIGHT_MODE_PHONG_ONLY
-#define LIGHT_MODE_PHONG_ONLY 0
-#endif
-#ifndef LIGHT_MODE_LAMBERT_PHONG
-#define LIGHT_MODE_LAMBERT_PHONG 1   // default, what should be best
-#endif
-
-#if (LIGHT_MODE_NO_LIGHTING + LIGHT_MODE_LAMBERT_ONLY + LIGHT_MODE_PHONG_ONLY + LIGHT_MODE_LAMBERT_PHONG) != 1
-#error "Select exactly one lighting mode: NO_LIGHTING / LAMBERT_ONLY / PHONG_ONLY / LAMBERT_PHONG"
-#endif
-
-// Derived feature toggles from mode
-#if LIGHT_MODE_NO_LIGHTING
-  #define LIGHT_USE_LAMBERT 0
-  #define LIGHT_USE_PHONG   0
-#elif LIGHT_MODE_LAMBERT_ONLY
-  #define LIGHT_USE_LAMBERT 1
-  #define LIGHT_USE_PHONG   0
-#elif LIGHT_MODE_PHONG_ONLY
-  #define LIGHT_USE_LAMBERT 0
-  #define LIGHT_USE_PHONG   1
-#else
-  #define LIGHT_USE_LAMBERT 1
-  #define LIGHT_USE_PHONG   1
-#endif
+enum LightMode : int32_t {
+  NO_LIGHTING = 0,
+  LAMBERT_ONLY = 1,
+  PHONG_ONLY = 2,
+  LAMBERT_PHONG = 3
+};
 
 // ------------------ Ambient modes ------------------
 // 0 = off
 // 1 = fixed constant
-// 2 = learned with sigmoid(ambients[0])
-#ifndef LIGHT_AMBIENT_MODE
-#define LIGHT_AMBIENT_MODE 2
-#endif
-
-#ifndef LIGHT_AMBIENT_FIXED
-#define LIGHT_AMBIENT_FIXED 0.02f
-#endif
+// 2 = learned, sigmoid(ambients[0])
+enum AmbientMode : int32_t {
+  AMBIENT_OFF = 0,
+  AMBIENT_FIXED = 1,
+  AMBIENT_LEARN = 2
+};
 
 // ------------------ Lambert options ------------------
-// 0 = clamp (max(ndotl,0))
-//1 = abs(ndotl), with max being default
-#ifndef LIGHT_LAMBERT_ABS
-#define LIGHT_LAMBERT_ABS 0
-#endif
+// 1 = clamp(max(ndotl,0))
+// 0 = abs(ndotl)
+enum LambertMode : int32_t {
+  LAMBERT_COS = 0,
+  LAMBERT_ABS = 1
+};
 
 // ------------------ Phong parameters ------------------
-#ifndef LIGHT_PHONG_KS_MODE
-#define LIGHT_PHONG_KS_MODE 1   // 1 to learn ks, 0 hard-coded
-#endif
+enum PhongKSMode : int32_t {
+  KS_HARDCODED = 0,
+  KS_LEARN = 1
+};
 
-#ifndef LIGHT_PHONG_KS
-#define LIGHT_PHONG_KS 0.10f
-#endif
-
-#ifndef LIGHT_PHONG_SHININESS
-#define LIGHT_PHONG_SHININESS 8.0f
-#endif
+enum PhongShinyMode: int32_t {
+  SHINY_HARDCODED = 0,
+  SHINY_LEARN = 1
+};
 
 // ------------------ Specular gating ------------------
 // 0 = none
 // 1 = backface gate only: spec = 0 if ndotl <= 0
 // 2 = scale by lambert
-#ifndef LIGHT_SPEC_GATING
-#define LIGHT_SPEC_GATING 2
-#endif
+enum SpecGatingMode : int32_t {
+  SPEC_GATING_OFF = 0,
+  SPEC_GATING_BACKFACE = 1,
+  SPEC_GATING_LAMBERTSCALE = 2
+};
 
-// ------------------ Energy compensation ------------------
+// ------------------ Energy conservation (compensation) ------------------
 // 0 = none
 // 1 = diffuse *= (1-ks)
-#ifndef LIGHT_ENERGY_COMP
-#define LIGHT_ENERGY_COMP 1
-#endif
+enum EnergyCompMode: int32_t {
+  ENERGY_COMP_OFF = 0,
+  ENERGY_COMP_ON = 1
+};
 
 // ------------------ Spotlight falloff ------------------
 // 0 = off
 // 1 = on
-#ifndef LIGHT_USE_SPOT
-#define LIGHT_USE_SPOT 1
-#endif
+enum UseSpotMode : int32_t {
+  LIGHT_SPOT_OFF = 0,
+  LIGHT_SPOT_ON = 1
+};
 
-// Spotlight params
-#ifndef LIGHT_SPOT_INNER_DEG
-#define LIGHT_SPOT_INNER_DEG 15.0f
-#endif
+// ------------------ STRUCT ------------------
 
-#ifndef LIGHT_SPOT_OUTER_DEG
-#define LIGHT_SPOT_OUTER_DEG 35.0f
-#endif
+struct LightingConfig {
+  // master
+  int32_t enable_fwd = 1;
+  int32_t enable_bwd = 1;
 
-// smooth ramp
-#ifndef LIGHT_SPOT_EXP
-#define LIGHT_SPOT_EXP 1.5f
-#endif
+  // light mode preset
+  int32_t light_mode = LightMode::LAMBERT_PHONG;
+
+  // ambient
+  int32_t ambient_mode = AmbientMode::AMBIENT_LEARN;
+  float ambient_fixed = 0.02f;
+
+  // lambert
+  int32_t lambert_mode = LambertMode::LAMBERT_COS;
+
+  // phong
+  int32_t phong_ks_mode = PhongKSMode::KS_LEARN;
+  int32_t phong_shiny_mode = PhongShinyMode::SHINY_HARDCODED;
+  float phong_ks = 0.1f;
+  float phong_shininess = 8.0f;
+
+  // spec gating
+  int32_t spec_gating = SpecGatingMode::SPEC_GATING_LAMBERTSCALE;
+
+  // energy compensation
+  int32_t energy_comp = EnergyCompMode::ENERGY_COMP_ON;
+
+  // spotlight
+  int32_t use_spot = UseSpotMode::LIGHT_SPOT_ON;
+  float spot_inner_deg = 15.0f;
+  float spot_outer_deg = 35.0f;
+  float spot_exp = 1.5f;
+};
 
 // Light constants
 #ifndef LIGHT_PI
 #define LIGHT_PI 3.14159265358979323846f
+#endif
+
+__device__ __forceinline__ const LightingConfig& get_lighting_cfg() {
+    return d_lighting_cfg;
+}
+
+#ifdef __CUDACC__
+__device__ __forceinline__ bool light_use_lambert(const LightingConfig& c) {
+    return (c.light_mode == LAMBERT_ONLY) || (c.light_mode == LAMBERT_PHONG);
+}
+__device__ __forceinline__ bool light_use_phong(const LightingConfig& c) {
+    return (c.light_mode == PHONG_ONLY) || (c.light_mode == LAMBERT_PHONG);
+}
 #endif
