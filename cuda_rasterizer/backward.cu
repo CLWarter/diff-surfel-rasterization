@@ -184,7 +184,7 @@ renderCUDA(
 	bool done = !inside;
 	int toDo = range.y - range.x;
 
-	const LightingConfig& cfg = get_lighting_cfg();
+	const LightingConfig cfg& = get_lighting_cfg();
 
 	const bool useLambert = light_use_lambert(cfg);
 	const bool usePhong   = light_use_phong(cfg);

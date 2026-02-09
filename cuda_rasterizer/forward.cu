@@ -290,7 +290,7 @@ renderCUDA(
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 	
-	const LightingConfig& cfg = get_lighting_cfg();
+	const LightingConfig cfg& = get_lighting_cfg();
 
 	const bool useLambert = light_use_lambert(cfg);
 	const bool usePhong   = light_use_phong(cfg);

@@ -6,12 +6,8 @@
 
 __device__ __constant__ LightingConfig d_lighting_cfg;
 
-void upload_lighting_config_to_cuda(const LightingConfig& cfg)
-{
-    cudaError_t err = cudaMemcpyToSymbol(
-        d_lighting_cfg, &cfg, sizeof(LightingConfig), 0, cudaMemcpyHostToDevice);
-    err = cudaDeviceSynchronize();
-    TORCH_CHECK(err == cudaSuccess, "cudaMemcpyToSymbol(d_lighting_cfg) failed: ", cudaGetErrorString(err));
+__device__ const LightingConfig& get_lighting_cfg_ref() {
+  return d_lighting_cfg;
 }
 
 // Layout indices (sync with python)
@@ -49,19 +45,25 @@ void SetLightingConfigCUDA(torch::Tensor cfg_tensor_cpu)
     cfg.enable_fwd       = (int32_t)p[I_ENABLE_FWD];
     cfg.enable_bwd       = (int32_t)p[I_ENABLE_BWD];
     cfg.light_mode       = (int32_t)p[I_LIGHT_MODE];
+
     cfg.ambient_mode     = (int32_t)p[I_AMBIENT_MODE];
     cfg.ambient_fixed    =        p[I_AMBIENT_FIXED];
+
     cfg.lambert_mode     = (int32_t)p[I_LAMBERT_MODE];
+
     cfg.phong_ks_mode    = (int32_t)p[I_PHONG_KS_MODE];
     cfg.phong_shiny_mode = (int32_t)p[I_PHONG_SHINY_MODE];
     cfg.phong_ks         =        p[I_PHONG_KS];
     cfg.phong_shininess  =        p[I_PHONG_SHININESS];
+
     cfg.spec_gating      = (int32_t)p[I_SPEC_GATING];
     cfg.energy_comp      = (int32_t)p[I_ENERGY_COMP];
+
     cfg.use_spot         = (int32_t)p[I_USE_SPOT];
     cfg.spot_inner_deg   =        p[I_SPOT_INNER];
     cfg.spot_outer_deg   =        p[I_SPOT_OUTER];
     cfg.spot_exp         =        p[I_SPOT_EXP];
 
-    upload_lighting_config_to_cuda(cfg);
+    cudaError_t err = cudaMemcpyToSymbol(d_lighting_cfg, &cfg, sizeof(LightingConfig));
+    TORCH_CHECK(err == cudaSuccess, "cudaMemcpyToSymbol(d_lighting_cfg) failed: ", cudaGetErrorString(err));
 }

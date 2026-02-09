@@ -108,15 +108,19 @@ struct LightingConfig {
 #define LIGHT_PI 3.14159265358979323846f
 #endif
 
-__device__ __forceinline__ const LightingConfig& get_lighting_cfg() {
-    return d_lighting_cfg;
+#ifdef __CUDACC__
+
+__device__ const LightingConfig& d_lighting_cfg;
+
+__device__ __forceinline__ LightingConfig get_lighting_cfg() {
+  return d_lighting_cfg;
 }
 
-#ifdef __CUDACC__
 __device__ __forceinline__ bool light_use_lambert(const LightingConfig& c) {
-    return (c.light_mode == LAMBERT_ONLY) || (c.light_mode == LAMBERT_PHONG);
+  return (c.light_mode == LAMBERT_ONLY) || (c.light_mode == LAMBERT_PHONG);
 }
 __device__ __forceinline__ bool light_use_phong(const LightingConfig& c) {
-    return (c.light_mode == PHONG_ONLY) || (c.light_mode == LAMBERT_PHONG);
+  return (c.light_mode == PHONG_ONLY) || (c.light_mode == LAMBERT_PHONG);
 }
+
 #endif
