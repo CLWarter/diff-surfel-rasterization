@@ -155,6 +155,7 @@ renderCUDA(
 	const float* __restrict__ colors,
 	const float* __restrict__ ambients,
 	const float* __restrict__ kspecular,
+	const float* __restrict__ shiny,
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
@@ -166,7 +167,8 @@ renderCUDA(
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
 	float* __restrict__ dL_dambients,
-	float* __restrict__ dL_dkspecular)
+	float* __restrict__ dL_dkspecular,
+	float* __restrict__ dL_dshiny)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -258,10 +260,12 @@ renderCUDA(
 	// per-thread accumulators
 	float dAmb = 0.0f;
 	float dKs = 0.0f;
+	float dSh = 0.0f;
 
 	// shared buffers for block reduction
 	__shared__ float amb_reduce[BLOCK_SIZE];
 	__shared__ float ks_reduce[BLOCK_SIZE];
+	__shared__ float shiny_reduce[BLOCK_SIZE];
 
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -342,7 +346,7 @@ renderCUDA(
 			#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular, shiny);
 
 				const float w = alpha * T;
 				const float dchannel_dcolor = w * Lout.diffuse_mul;
@@ -419,6 +423,23 @@ renderCUDA(
 				const float dL_dks = dL_dspec_add * dspecadd_dks + dL_ddiffuse_mul * ddiffmul_dks;
 
 				dKs += dL_dks * Lout.dkspecular;
+			}
+			#endif
+
+			#if LIGHT_USE_PHONG && (LIGHT_PHONG_SHININESS_MODE == 1)
+			{
+				float ndoth = Lout.ndoth;
+
+				if (dL_dspec != 0.0f && ndoth > 0.0f)
+				{
+					float ln_ndoth = logf(fmaxf(ndoth, 1e-8f));
+					float dspecpow_dshin = Lout.spec_pow * ln_ndoth;
+
+					float mult = (Lout.spec_pow > 0.0f) ? (Lout.spec_base / Lout.spec_pow) : 0.0f;
+
+					float dspecadd_dshin = Lout.kspec * (mult * dspecpow_dshin);
+					dSh += dL_dspec * dspecadd_dshin * Lout.dshin_raw;  // chain: dshin/draw
+				}
 			}
 			#endif
 
@@ -659,6 +680,21 @@ renderCUDA(
 			if (block.thread_rank() == 0)
 				atomicAdd(&dL_dkspecular[0], ks_reduce[0]);
 		}
+	#endif
+
+	#if LIGHT_ENABLE_BWD && LIGHT_USE_PHONG && (LIGHT_PHONG_SHININESS_MODE == 1)
+	{
+		shiny_reduce[block.thread_rank()] = dSh;
+		block.sync();
+
+		for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1) {
+			if (block.thread_rank() < stride)
+				shiny_reduce[block.thread_rank()] += shiny_reduce[block.thread_rank() + stride];
+			block.sync();
+		}
+		if (block.thread_rank() == 0)
+			atomicAdd(&dL_dshiny[0], shiny_reduce[0]);
+	}
 	#endif
 }
 
@@ -916,6 +952,7 @@ void BACKWARD::render(
 	const float* colors,
 	const float* ambients,
 	const float* kspecular,
+	const float* shiny,
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
@@ -928,7 +965,8 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors,
 	float* dL_dambient,
-	float* dL_dkspecular)
+	float* dL_dkspecular,
+	float* dL_dshiny)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -942,6 +980,7 @@ void BACKWARD::render(
 		colors,
 		ambients,
 		kspecular,
+		shiny,
 		depths,
 		final_Ts,
 		n_contrib,
@@ -953,6 +992,7 @@ void BACKWARD::render(
 		dL_dopacity,
 		dL_dcolors,
 		dL_dambient,
-		dL_dkspecular
+		dL_dkspecular,
+		dL_dshiny
 		);
 }

@@ -60,6 +60,7 @@ namespace FORWARD
 		const float* features,
 		const float* ambients,
 		const float* kspecular,
+		const float* shiny,
 		const float* transMats,
 		const float* depths,
 		const float4* normal_opacity,

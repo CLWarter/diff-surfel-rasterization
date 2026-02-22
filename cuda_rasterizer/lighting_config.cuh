@@ -68,6 +68,13 @@
 #define LIGHT_PHONG_KS_MODE 1   // 1 to learn ks, 0 hard-coded
 #endif
 
+// 0 = fixed LIGHT_PHONG_SHININESS define
+// 1 = learned per-scene shininess (scalar in [SHINY_MIN, SHINY_MAX])
+#define LIGHT_PHONG_SHININESS_MODE 1
+
+#define LIGHT_SHINY_MIN  2.0f
+#define LIGHT_SHINY_MAX  128.0f
+
 #ifndef LIGHT_PHONG_KS
 #define LIGHT_PHONG_KS 0.10f
 #endif

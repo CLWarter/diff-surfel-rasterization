@@ -266,6 +266,7 @@ renderCUDA(
 	const float* __restrict__ features,
 	const float* __restrict__ ambients,
 	const float* __restrict__ kspecular,
+	const float* __restrict__ shiny,
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
@@ -403,7 +404,7 @@ renderCUDA(
 
 			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular, shiny);
 
 				w_diff = w * Lout.diffuse_mul;
 
@@ -486,6 +487,7 @@ void FORWARD::render(
 	const float* colors,
 	const float* ambients,
 	const float* kspecular,
+	const float* shiny,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
@@ -504,6 +506,7 @@ void FORWARD::render(
 		colors,
 		ambients,
 		kspecular,
+		shiny,
 		transMats,
 		depths,
 		normal_opacity,

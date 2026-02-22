@@ -11,6 +11,10 @@ struct LightingOut {
     float ambient;     // ambient value
     float kspec;       // specular factor
     float dkspecular;  // derivative of spec factor
+    float shiny;
+    float dshin_raw;
+    float ndoth;
+    float spec_pow;
     float spec_base;   // spec without ks
 };
 
@@ -103,6 +107,18 @@ float kspec_value(const float* kspecs)
 #endif
 }
 
+__device__ __forceinline__ float shininess_value(const float* shiny_raw, float* dshin_raw_out)
+{
+#if (LIGHT_PHONG_SHININESS_MODE == 1)
+    float t = sigmoidf_stable(shiny_raw[0]);        // in (0,1)
+    if (dshin_raw_out) *dshin_raw_out = t * (1.0f - t); // dt/draw
+    return LIGHT_SHINY_MIN + (LIGHT_SHINY_MAX - LIGHT_SHINY_MIN) * t;
+#else
+    if (dshin_raw_out) *dshin_raw_out = 0.0f;
+    return LIGHT_PHONG_SHININESS;
+#endif
+}
+
 // Spotlight axis: camera forward (+Z)
 __device__ __forceinline__ float spotlight_factor(const float3& light_dir_cam_to_surf) {
 #if LIGHT_USE_SPOT
@@ -129,7 +145,8 @@ LightingOut eval_lighting(
     float focal_x, float focal_y,
     float3 n_raw,
     const float* __restrict__ ambients,
-    const float* __restrict__ kspecs
+    const float* __restrict__ kspecs,
+    const float* __restrict__ shiny
 ) {
     LightingOut o;
     o.diffuse_mul = 1.0f;
@@ -193,7 +210,18 @@ LightingOut eval_lighting(
         dkspecular = ks * (1.0f - ks);
     #endif
 
-    float spec_base = specular * spot;
+    float dshin_dt = 0.0f;
+    float shin = shininess_value(shiny, &dshin_dt);
+
+    float ndoth_clamped = fmaxf(n.x*Hh.x + n.y*Hh.y + n.z*Hh.z, 0.0f);
+    float spec_pow = (ndoth_clamped > 0.0f) ? powf(ndoth_clamped, shin) : 0.0f;
+
+    o.shiny = shin;
+    o.dshin_raw = dshin_dt * (LIGHT_SHINY_MAX - LIGHT_SHINY_MIN); // dshin/draw
+    o.ndoth = ndoth_clamped;
+    o.spec_pow = spec_pow;
+
+    float spec_base = spec_pow * spot;
 
     #if (LIGHT_SPEC_GATING == 1)
             if (ndotl <= 0.0f) spec_base = 0.0f;
@@ -212,6 +240,7 @@ LightingOut eval_lighting(
 
     o.kspec = ks;
     o.dkspecular = dkspecular;
+    o.shiny = shin;
     o.spec_base = spec_base;
 
 #else
