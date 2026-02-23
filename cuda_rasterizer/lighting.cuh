@@ -1,0 +1,296 @@
+#pragma once
+#include "lighting_config.cuh"
+
+struct LightingOut {
+    float diffuse_mul; // multiplied to base color
+    float diffuse_base; // diffuse without energy compensation
+    float spec_add;    // additive spec
+    float lambert;     // lambert tern
+    float ndotl;       // n*L
+    float intensity;
+    float dintensity_dz;
+    float spot;        // spotlight factor
+    float ambient;     // ambient value
+    float kspec;       // specular factor
+    float dkspecular;  // derivative of spec factor
+    float shiny;
+    float dshin_raw;
+    float ndoth;
+    float spec_pow;
+    float spec_base;   // spec without ks
+};
+
+__device__ __forceinline__ float3 apply_norm_jacobian(float3 n_raw, float3 g_unit)
+{
+    // n_hat = n_raw / ||n_raw||
+    float len2 = n_raw.x*n_raw.x + n_raw.y*n_raw.y + n_raw.z*n_raw.z;
+    if (len2 <= 1e-20f) return make_float3(0.f, 0.f, 0.f);
+
+    float inv_len = rsqrtf(len2);
+    float3 n_hat = make_float3(n_raw.x * inv_len, n_raw.y * inv_len, n_raw.z * inv_len);
+
+    // Project g_unit onto tangent plane
+    float dotng = n_hat.x*g_unit.x + n_hat.y*g_unit.y + n_hat.z*g_unit.z;
+    float3 g_proj = make_float3(
+        g_unit.x - n_hat.x * dotng,
+        g_unit.y - n_hat.y * dotng,
+        g_unit.z - n_hat.z * dotng
+    );
+    // Normalize
+    return make_float3(g_proj.x * inv_len, g_proj.y * inv_len, g_proj.z * inv_len);
+}
+
+__device__ __forceinline__
+float3 compute_light_dir(const float2& pixf,
+                                   int W, int H,
+                                   float focal_x, float focal_y)
+{
+    float x = (pixf.x - 0.5f * (float)W) / focal_x;
+    float y = (pixf.y - 0.5f * (float)H) / focal_y;
+    float3 v = make_float3(x, y, 1.0f);
+
+    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
+    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 1.f);
+
+    float inv_len = rsqrtf(len2);
+    v.x *= inv_len;
+    v.y *= inv_len;
+    v.z *= inv_len;
+    return v;
+}
+
+__device__ __forceinline__ float distance_attenuation(float d, int mode, float k) {
+    if (mode == 0) return 1.0f;
+    // mode 1: quadratic
+    return 1.0f / (1.0f + k * d * d);
+}
+
+__device__ __forceinline__ float inv_quadratic_falloff(float d)
+{
+    // Hardcode for now (your “no dynamic config” branch)
+    // k controls how fast it falls off; tune later
+    const float k = 0.15f;
+    return 1.0f / (1.0f + k * d * d);
+}
+
+__device__ __forceinline__ float sigmoidf_stable(float x)
+{
+    // stable sigmoid avoids exp overflow
+    if (x >= 0.0f) {
+        float z = expf(-x);
+        return 1.0f / (1.0f + z);
+    } else {
+        float z = expf(x);
+        return z / (1.0f + z);
+    }
+}
+
+__device__ __forceinline__ float3 normalize_or_default(float3 v, float3 def) {
+    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
+    if (len2 <= 1e-20f) return def;
+    float inv = rsqrtf(len2);
+    v.x *= inv; v.y *= inv; v.z *= inv;
+    return v;
+}
+
+__device__ __forceinline__ float clamp01(float x) { return fminf(fmaxf(x, 0.0f), 1.0f); }
+
+__device__ __forceinline__ float smoothstep01(float t) {
+    t = clamp01(t);
+    return t*t*(3.0f - 2.0f*t);
+}
+
+__device__ __forceinline__ float ambient_value(const float* __restrict__ ambients) {
+#if (LIGHT_AMBIENT_MODE == 0)
+    (void)ambients;
+    return 0.0f;
+#elif (LIGHT_AMBIENT_MODE == 1)
+    (void)ambients;
+    return LIGHT_AMBIENT_FIXED;
+#else
+    const float amax = 0.25f;
+    float t = sigmoidf_stable(ambients[0]);
+    return amax * t;
+#endif
+}
+
+__device__ __forceinline__
+float kspec_value(const float* kspecs)
+{
+#if (LIGHT_PHONG_KS_MODE == 1)
+    // learned scalar value between [0,1]
+    return sigmoidf_stable(kspecs[0]);
+#else
+    return LIGHT_PHONG_KS;
+#endif
+}
+
+__device__ __forceinline__ float shininess_value(const float* shiny_raw, float* dshin_raw_out)
+{
+#if (LIGHT_PHONG_SHININESS_MODE == 1)
+    float t = sigmoidf_stable(shiny_raw[0]);        // in (0,1)
+    if (dshin_raw_out) *dshin_raw_out = t * (1.0f - t); // dt/draw
+    return LIGHT_SHINY_MIN + (LIGHT_SHINY_MAX - LIGHT_SHINY_MIN) * t;
+#else
+    if (dshin_raw_out) *dshin_raw_out = 0.0f;
+    return LIGHT_PHONG_SHININESS;
+#endif
+}
+
+// Spotlight axis: camera forward (+Z)
+__device__ __forceinline__ float spotlight_factor(const float3& light_dir_cam_to_surf) {
+#if LIGHT_USE_SPOT
+    const float3 axis = make_float3(0.f, 0.f, 1.f);
+    float cosTheta = light_dir_cam_to_surf.x*axis.x + light_dir_cam_to_surf.y*axis.y + light_dir_cam_to_surf.z*axis.z;
+
+    const float innerCos = cosf(LIGHT_SPOT_INNER_DEG * (LIGHT_PI / 180.f));
+    const float outerCos = cosf(LIGHT_SPOT_OUTER_DEG * (LIGHT_PI / 180.f));
+
+    float denom = fmaxf(innerCos - outerCos, 1e-6f);
+    float t = (cosTheta - outerCos) / denom;
+    float s = smoothstep01(t);
+    if (LIGHT_SPOT_EXP != 1.0f) s = powf(s, LIGHT_SPOT_EXP);
+    return s;
+#else
+    (void)light_dir_cam_to_surf;
+    return 1.0f;
+#endif
+}
+
+__device__ __forceinline__
+LightingOut eval_lighting(
+    const float2& pixf,
+    int W, int H,
+    float focal_x, float focal_y,
+    float3 n_raw,
+    float depth_cam,
+    const float* __restrict__ ambients,
+    const float* __restrict__ kspecs,
+    const float* __restrict__ shiny
+) {
+    LightingOut o;
+    o.diffuse_mul = 1.0f;
+    o.spec_add    = 0.0f;
+    o.lambert     = 1.0f;
+    o.ndotl       = 1.0f;
+    o.intensity   = 1.0f;
+    o.spot        = 1.0f;
+    o.ambient     = 0.0f;
+
+#if (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+    float3 n = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
+
+    float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);         // camera->surface
+    light_dir = normalize_or_default(light_dir, make_float3(0.f,0.f,1.f));
+
+    float3 V = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);           // surface->camera
+    V = normalize_or_default(V, make_float3(0.f,0.f,-1.f));
+
+    float3 L = V;                                                               // flashlight at camera
+    L = normalize_or_default(L, make_float3(0.f,0.f,-1.f));
+
+    float spot = spotlight_factor(light_dir);
+    o.spot = spot;
+
+    float ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
+    o.ndotl = ndotl;
+
+#if LIGHT_USE_LAMBERT
+  #if LIGHT_LAMBERT_ABS
+    float lambert = fabsf(ndotl);
+  #else
+    float lambert = fmaxf(ndotl, 0.0f);
+  #endif
+#else
+    float lambert = 1.0f;
+#endif
+    o.lambert = lambert;
+
+    float dz = fmaxf(fabsf(light_dir.z), 1e-6f);
+    float dist = fabsf(depth_cam) / dz;
+    dist = fmaxf(dist, 1e-6f);
+
+    const float I = 1.0f;
+    const float k = FALLOFF_K;
+
+    float denom = 1.0f + k * dist * dist;
+    float inv   = 1.0f / denom;
+
+    float Li = I * inv;
+    float dLi_dd = I * (-2.0f * k * dist) * (inv * inv);
+
+    float dLi_dz = dLi_dd * (1.0f / dz);
+
+    o.intensity = Li;
+    o.dintensity_dz = dLi_dz;
+
+    float a = ambient_value(ambients);
+    o.ambient = a;
+
+#if LIGHT_USE_LAMBERT
+    float diffuse = a + (1.0f - a) * lambert * spot * Li;
+    o.diffuse_base = diffuse;
+#else
+    // Phong-only: base color
+    float diffuse = 1.0f;
+    o.diffuse_base = 1.0f;
+#endif
+
+#if LIGHT_USE_PHONG
+    float3 Hh = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
+    Hh = normalize_or_default(Hh, make_float3(0.f,0.f,-1.f));
+    float ndoth = fmaxf(n.x*Hh.x + n.y*Hh.y + n.z*Hh.z, 0.0f);
+
+    float ks = kspec_value(kspecs);
+
+    float dkspecular = 0.0f;
+    #if (LIGHT_PHONG_KS_MODE == 1)
+        dkspecular = ks * (1.0f - ks);
+    #endif
+
+    float dshin_dt = 0.0f;
+    float shin = shininess_value(shiny, &dshin_dt);
+
+    float ndoth_clamped = fmaxf(n.x*Hh.x + n.y*Hh.y + n.z*Hh.z, 0.0f);
+    float spec_pow = (ndoth_clamped > 0.0f) ? powf(ndoth_clamped, shin) : 0.0f;
+
+    o.shiny = shin;
+    o.dshin_raw = dshin_dt * (LIGHT_SHINY_MAX - LIGHT_SHINY_MIN); // dshin/draw
+    o.ndoth = ndoth_clamped;
+    o.spec_pow = spec_pow;
+
+    float spec_base = spec_pow * spot * Li;
+
+    #if (LIGHT_SPEC_GATING == 1)
+            if (ndotl <= 0.0f) spec_base = 0.0f;
+        #elif (LIGHT_SPEC_GATING == 2)
+            spec_base *= lambert;
+        #endif
+
+    float spec = ks * spec_base;
+
+    // energy compensation
+    #if LIGHT_ENERGY_COMP
+        #if LIGHT_USE_LAMBERT
+            diffuse *= (1.0f - ks);
+        #endif
+    #endif
+
+    o.kspec = ks;
+    o.dkspecular = dkspecular;
+    o.shiny = shin;
+    o.spec_base = spec_base;
+
+#else
+    float spec = 0.0f;
+    o.kspec = 0.0f;
+    o.dkspecular = 0.0f;
+    o.spec_base = 0.0f;
+#endif
+
+    o.diffuse_mul = diffuse;
+    o.spec_add    = spec;
+#endif
+
+    return o;
+}

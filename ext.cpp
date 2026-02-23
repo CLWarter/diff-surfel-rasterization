@@ -11,9 +11,11 @@
 
 #include <torch/extension.h>
 #include "rasterize_points.h"
+#include "build_info.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
   m.def("mark_visible", &markVisible);
+  m.def("get_lighting_build_info", &get_lighting_build_info, "Get lighting build info");
 }

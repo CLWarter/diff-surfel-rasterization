@@ -11,6 +11,7 @@
 
 #include "backward.h"
 #include "auxiliary.h"
+#include "lighting.cuh"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -138,37 +139,6 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
-__device__ __forceinline__
-float3 compute_light_dir(const float2& pixf,
-                                   int W, int H,
-                                   float focal_x, float focal_y)
-{
-    float x = (pixf.x - 0.5f * (float)W) / focal_x;
-    float y = (pixf.y - 0.5f * (float)H) / focal_y;
-    float3 v = make_float3(x, y, 1.0f);
-
-    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
-    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 1.f);
-
-    float inv_len = rsqrtf(len2);
-    v.x *= inv_len;
-    v.y *= inv_len;
-    v.z *= inv_len;
-    return v;
-}
-
-__device__ __forceinline__ float sigmoidf_stable(float x)
-{
-    // stable sigmoid to avoid exp overflow
-    if (x >= 0.0f) {
-        float z = expf(-x);
-        return 1.0f / (1.0f + z);
-    } else {
-        float z = expf(x);
-        return z / (1.0f + z);
-    }
-}
-
 
 // Backward version of the rendering procedure.
 template <uint32_t C>
@@ -184,6 +154,8 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ colors,
 	const float* __restrict__ ambients,
+	const float* __restrict__ kspecular,
+	const float* __restrict__ shiny,
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
@@ -194,7 +166,9 @@ renderCUDA(
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_dambients)
+	float* __restrict__ dL_dambients,
+	float* __restrict__ dL_dkspecular,
+	float* __restrict__ dL_dshiny)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -283,6 +257,16 @@ renderCUDA(
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
+	// per-thread accumulators
+	float dAmb = 0.0f;
+	float dKs = 0.0f;
+	float dSh = 0.0f;
+
+	// shared buffers for block reduction
+	__shared__ float amb_reduce[BLOCK_SIZE];
+	__shared__ float ks_reduce[BLOCK_SIZE];
+	__shared__ float shiny_reduce[BLOCK_SIZE];
+
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -355,239 +339,204 @@ renderCUDA(
 
 			
 			// ================= LAMBERT + PHONG SHADING (BACKWARD) ======================
-			float diffuse_shading = 1.0f;   // multiplies base color
-			float spec_term       = 0.0f;   // added (usually white)
-			float lambert         = 1.0f;
-			float specular        = 0.0f;
-			float ndotl           = 0.0f;
 
+			float dL_dalpha = 0.0f;
 			const int global_id = collected_id[j];
-			float ambient = 1.0f / (1.0f + expf(-ambients[global_id])); // per-gaussian scalar
-			ambient = fminf(fmaxf(ambient, 0.0f), 1.0f);
 
-			float3 n = make_float3(normal[0], normal[1], normal[2]);
-			float3 L = make_float3(0,0,1);
-			float3 V = make_float3(0,0,1);
+			#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 
-			#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
-				float len2 = n.x*n.x + n.y*n.y + n.z*n.z;
-				if (len2 > 1e-8f) {
-					float inv_n = rsqrtf(len2);
-					n.x *= inv_n; n.y *= inv_n; n.z *= inv_n;
-				} else {
-					n = make_float3(0.f, 0.f, 1.f);
-				}
+				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, kspecular, shiny);
 
-				// light dir: camera -> surface
-				float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
-				// V turns the light dir to the surface -> camera
-				V = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);
+				const float w = alpha * T;
+				const float dchannel_dcolor = w * Lout.diffuse_mul;
 
-			#if USE_HEADLIGHT
-				//L = make_float3(0.f, 0.f, 1.f); // -1 in z -> light_dir towards Camera
-				L = make_float3(0.f, 0.f, -1.f);
-			#else
-				L = V;
-			#endif
+				float dL_ddiffuse = 0.0f;
+				float dL_dspec    = 0.0f;
 
-				float l2 = L.x*L.x + L.y*L.y + L.z*L.z;
-				if (l2 > 1e-8f) { float inv = rsqrtf(l2); L.x*=inv; L.y*=inv; L.z*=inv; }
-
-			/*
-			// Spotlight direction: camera forward (so +Z) in camera space
-			const float3 spotDir = make_float3(0.f, 0.f, 1.f);
-
-			// cos angle between camera->surface and spotlight axis
-			float cosTheta = light_dir.x*spotDir.x + light_dir.y*spotDir.y + light_dir.z*spotDir.z;
-			
-			// cone angles (try to find one fitting the flashlight)
-			const float innerCos = 0.98; // about 11,5 degree 
-			const float outerCos = 0.92; // about 23,1 degree
-
-			// Smoothstep-ramp
-			float spot = 0.0f;
-			if (cosTheta >= innerCos) {
-				spot = 1.0f;
-			} else if (cosTheta <= outerCos) {
-				spot = 0.0f;
-			} else {
-				float t = (cosTheta - outerCos) / (innerCos - outerCos);
-				spot = t * t * (3.0f - 2.0f * t);
-			}
-			
-			// optional: make it “tighter / stronger”
-			// spot = spot * spot; // uncomment to sharpen
-			*/
-
-			ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
-
-			#if ENABLE_LAMBERT_SHADING
-			#   if USE_ABS_COS_SHADING
-					lambert = fabsf(ndotl);
-			#   else
-					lambert = fmaxf(ndotl, 0.0f);
-			#   endif
-			#else
-				lambert = 1.0f;
-			#endif
-
-			diffuse_shading = (ambient + (1.0f - ambient) * lambert); // * spot;
-
-			#if ENABLE_PHONG_SPECULAR
-				// H = normalize(L + V)
-				float3 H = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
-				float h2 = H.x*H.x + H.y*H.y + H.z*H.z;
-				if (h2 > 1e-8f) {
-					float invh = rsqrtf(h2);
-					H.x *= invh; H.y *= invh; H.z *= invh;
-
-					float ndoth = fmaxf(n.x*H.x + n.y*H.y + n.z*H.z, 0.0f);
-					specular = powf(ndoth, PHONG_SHININESS);
-				} else {
-					specular = 0.0f;
-				}
-				spec_term = PHONG_KS * specular ; //* spot;
+				#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+					float dL_ddiffuse_shading = 0.0f; // for ambient gradient
 				#endif
-			#else
-				lambert = 1.0f;
-				diffuse_shading = 1.0f;
-    			spec_term = 0.0f;
-			#endif
 
-			#if ENABLE_LAMBERT_SHADING
-			diffuse_shading *= (1.0f - PHONG_KS);  // light energy compensation
-			#endif
-			#if ENABLE_PHONG_SPECULAR
-			spec_term *= lambert;                 // make spec vanish at grazing/back-facing
-			#endif
+				for (int ch = 0; ch < C; ch++)
+				{
+					const float c = collected_colors[ch * BLOCK_SIZE + j];
+					const float dL_dchannel = dL_dpixel[ch];
 
-// --------------------------------------------------------------
+					// ambient gradient
+					#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+						dL_ddiffuse_shading += dL_dchannel * (w * c);
+					#endif
 
-		const float w = alpha * T;
-		const float dchannel_dcolor = w * diffuse_shading;
+					// reccurence
+					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+					last_color[ch] = c;
 
-		// gradients w.r.t alpha
-		float dL_dalpha = 0.0f;
+					float eff = Lout.diffuse_mul * c;
+					#if LIGHT_USE_PHONG
+						if (ch < 3) eff += Lout.spec_add;
+					#endif
 
-		// accumulate dL/d(shading) if any normal grads are enabled
-		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
-			(ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD)
-			float dL_ddiffuse = 0.0f;
-			float dL_dspec = 0.0f;
-		#endif
+					accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
+					last_eff[ch] = eff;
 
-		float dL_ddiffuse_shading = 0.0f;
+					dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
 
-		for (int ch = 0; ch < C; ch++)
-		{
-			const float c = collected_colors[ch * BLOCK_SIZE + j];
-			const float dL_dchannel = dL_dpixel[ch];
+					// gradients needed for spec path
+					dL_ddiffuse += dL_dchannel * (w * c);
+					#if LIGHT_USE_PHONG
+						if (ch < 3) dL_dspec += dL_dchannel * w;
+					#endif
 
-			dL_ddiffuse_shading += dL_dchannel * (w * c);
+					atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				}
 
-			accum_rec[ch] = last_alpha * last_color[ch]
-						+ (1.f - last_alpha) * accum_rec[ch];
-			last_color[ch] = c;
+			// ---------- Ambient gradient (learned only) ----------
+			#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+			{
+				float d_diffuse_da = 1.0f - (Lout.lambert * Lout.spot * Lout.intensity);
 
-			float eff = diffuse_shading * c;
-			#if ENABLE_PHONG_SPECULAR
-				if (ch < 3) eff += spec_term;
-			#endif
+				#if LIGHT_ENERGY_COMP
+					d_diffuse_da *= (1.0f - Lout.kspec);
+				#endif
 
-			accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
-			last_eff[ch] = eff;
-
-			// shading factor appears in alpha gradient
-			dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
-
-			#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
-				(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
-				// diffuse part: I_ch += w * diffuse_shading * c
-				dL_ddiffuse += dL_dchannel * (w * c);
-
-				// spec part: I_rgb += w * spec_term   (white add)
-			#if ENABLE_PHONG_SPECULAR
-				if (ch < 3) dL_dspec += dL_dchannel * w;
-			#endif
-			#endif
-
-			// ∂I/∂c = w * shading
-			atomicAdd(&(dL_dcolors[global_id * C + ch]),
-					dchannel_dcolor * dL_dchannel);
-		}
-
-		float d_diffuse_d_ambient = (1.0f - lambert);
-		#if ENABLE_LAMBERT_SHADING
-		d_diffuse_d_ambient *= (1.0f - PHONG_KS);
-		#endif
-		float d_ambient_d_raw = ambient * (1.0f - ambient);
-		
-		atomicAdd(&dL_dambients[global_id], dL_ddiffuse_shading * d_diffuse_d_ambient * d_ambient_d_raw);
-
-		// ---------- Normal gradient from Lambert + Blinn-Phong --------------------
-		#if (ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD) || \
-			(ENABLE_PHONG_SPECULAR  && ENABLE_PHONG_NORMAL_GRAD)
-
-		if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f) {
-
-		// --- Lambert path ---
-		#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
-			// diffuse_shading = (1-PHONG_KS) * (ambient + (1-ambient)*lambert)
-			float dL_dlambert = dL_ddiffuse * (1.0f - PHONG_KS) * (1.0f - ambient); // * spot;
-		#else
-			float dL_dlambert = 0.0f;
-		#endif
-
-		// plus: spec_term *= lambert  => spec contributes to lambert too
-		#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
-			// spec_term = lambert * (PHONG_KS * specular)
-			dL_dlambert += dL_dspec * (PHONG_KS * specular); //* spot;
-		#endif
-
-			float dL_dndotl = 0.0f;
-			#if ENABLE_LAMBERT_SHADING && ENABLE_LAMBERT_NORMAL_GRAD
-			#   if USE_ABS_COS_SHADING
-					if (ndotl > 0.0f)       dL_dndotl += dL_dlambert;
-					else if (ndotl < 0.0f)  dL_dndotl -= dL_dlambert;
-			#   else
-					if (ndotl > 0.0f)       dL_dndotl += dL_dlambert; // max(ndotl,0)
-			#   endif
-			#endif
-
-			if (dL_dndotl != 0.0f) {
-				atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndotl * L.x);
-				atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndotl * L.y);
-				atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndotl * L.z);
+				const float amax = 0.25f;
+				float t = sigmoidf_stable(ambients[0]);
+				float da_draw = amax * t * (1.0f - t);
+				dAmb += dL_ddiffuse_shading * d_diffuse_da * da_draw;
 			}
+			#endif
 
-		// ---- Specular ndoth path ---------------------
-		#if ENABLE_PHONG_SPECULAR && ENABLE_PHONG_NORMAL_GRAD
-			if (dL_dspec != 0.0f) {
-				float3 Hh = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
-				float h2 = Hh.x*Hh.x + Hh.y*Hh.y + Hh.z*Hh.z;
-				if (h2 > 1e-8f) {
-					float invh = rsqrtf(h2);
-					Hh.x *= invh; Hh.y *= invh; Hh.z *= invh;
+			// ----- kspecular gradient (learned scalar) -----
+			#if LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
+			{
+				const float dL_dspec_add = dL_dspec;
+				const float dL_ddiffuse_mul = dL_ddiffuse;
+				const float dspecadd_dks = Lout.spec_base;
 
-					float ndoth = n.x*Hh.x + n.y*Hh.y + n.z*Hh.z;
+				// diffuse energy compensation term
+				float ddiffmul_dks = 0.0f;
+				#if LIGHT_ENERGY_COMP && LIGHT_USE_LAMBERT
+					ddiffmul_dks = -Lout.diffuse_base;
+				#endif
+
+				const float dL_dks = dL_dspec_add * dspecadd_dks + dL_ddiffuse_mul * ddiffmul_dks;
+
+				dKs += dL_dks * Lout.dkspecular;
+			}
+			#endif
+
+			#if LIGHT_USE_PHONG && (LIGHT_PHONG_SHININESS_MODE == 1)
+			{
+				float ndoth = Lout.ndoth;
+
+				if (dL_dspec != 0.0f && ndoth > 0.0f)
+				{
+					float ln_ndoth = logf(fmaxf(ndoth, 1e-8f));
+					float dspecpow_dshin = Lout.spec_pow * ln_ndoth;
+
+					float mult = (Lout.spec_pow > 0.0f) ? (Lout.spec_base / Lout.spec_pow) : 0.0f;
+
+					float dspecadd_dshin = Lout.kspec * (mult * dspecpow_dshin);
+					dSh += dL_dspec * dspecadd_dshin * Lout.dshin_raw;  // chain: dshin/draw
+				}
+			}
+			#endif
+
+			// ---------- Normal gradient approximation ----------
+			if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f)
+			{
+				float dL_dndotl = 0.0f;
+
+				#if LIGHT_USE_LAMBERT
+				{
+					float a = 0.0f;
+					#if (LIGHT_AMBIENT_MODE == 2)
+						a = Lout.ambient;
+					#elif (LIGHT_AMBIENT_MODE == 1)
+						a = LIGHT_AMBIENT_FIXED;
+					#endif
+
+					float dL_dlambert = dL_ddiffuse * (1.0f - a) * Lout.spot * Lout.intensity;
+
+					#if LIGHT_ENERGY_COMP
+						dL_dlambert *= (1.0f - Lout.kspec);
+					#endif
+
+					#if LIGHT_LAMBERT_ABS
+						if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert;
+						else if (Lout.ndotl < 0.0f) dL_dndotl -= dL_dlambert;
+					#else
+						if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert; // max(ndotl,0)
+					#endif
+				}
+				#endif
+
+				float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
+				light_dir = normalize_or_default(light_dir, make_float3(0.f,0.f,1.f));
+				float3 Lvec = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);
+				Lvec = normalize_or_default(Lvec, make_float3(0.f,0.f,-1.f));
+
+				if (dL_dndotl != 0.0f) {
+					atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndotl * Lvec.x);
+					atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndotl * Lvec.y);
+					atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndotl * Lvec.z);
+				}
+
+				// Specular ndoth path
+				#if LIGHT_USE_PHONG
+				if (dL_dspec != 0.0f)
+				{
+					float3 n_unit = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
+					float3 Vvec = Lvec;
+
+					float3 Hh = make_float3(Lvec.x + Vvec.x, Lvec.y + Vvec.y, Lvec.z + Vvec.z);
+					Hh = normalize_or_default(Hh, make_float3(0.f,0.f,-1.f));
+
+					float ndoth = n_unit.x*Hh.x + n_unit.y*Hh.y + n_unit.z*Hh.z;
 					if (ndoth > 0.0f) {
-						float spec_deriv = PHONG_SHININESS * powf(ndoth, PHONG_SHININESS - 1.0f);
+						float spec_deriv = Lout.shiny * powf(ndoth, Lout.shiny - 1.0f);
 
-						// spec_term = PHONG_KS * specular => d(spec_term)/d(ndoth) = PHONG_KS * spec_deriv
-						float dL_dndoth = dL_dspec * (lambert * PHONG_KS) * spec_deriv;
+						float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot * Lout.intensity;
+
+						#if (LIGHT_SPEC_GATING == 1)
+							if (Lout.ndotl <= 0.0f) dspec_dndoth = 0.0f;
+						#elif (LIGHT_SPEC_GATING == 2)
+							dspec_dndoth *= Lout.lambert;
+						#endif
+
+						float dL_dndoth = dL_dspec * dspec_dndoth;
 
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 0], dL_dndoth * Hh.x);
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 1], dL_dndoth * Hh.y);
 						atomicAdd(&dL_dnormal3D[global_id * 3 + 2], dL_dndoth * Hh.z);
 					}
 				}
+				#endif
 			}
-		#endif // Phong normal grad
 
-		}
+			#else
+				// No lighting, original 2DGS
+				const float w = alpha * T;
+				const float dchannel_dcolor = w;
 
-		#endif
-		// --------------------------------------------------------------------------
+				for (int ch = 0; ch < C; ch++) {
+					const float c = collected_colors[ch * BLOCK_SIZE + j];
+					const float dL_dchannel = dL_dpixel[ch];
+
+					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+					last_color[ch] = c;
+
+					float eff = c; // diffuse_mul == 1
+					accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
+					last_eff[ch] = eff;
+
+					dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
+
+					atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				}
+			#endif
+
 		// ========== END LAMBERT + PHONG SHADING (BACKWARD) ========================
 
             float dL_dz      = 0.0f;
@@ -695,6 +644,58 @@ renderCUDA(
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 		}
 	}
+
+	#if LIGHT_ENABLE_BWD && LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+	{
+		// write each threads contribution
+		amb_reduce[block.thread_rank()] = dAmb;
+		block.sync();
+
+		// reduce within block
+		for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1)
+		{
+			if (block.thread_rank() < stride)
+				amb_reduce[block.thread_rank()] += amb_reduce[block.thread_rank() + stride];
+			block.sync();
+		}
+
+		// store one atomic per block
+		if (block.thread_rank() == 0)
+			atomicAdd(&dL_dambients[0], amb_reduce[0]);
+	}
+	#endif
+
+	#if LIGHT_ENABLE_BWD && LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
+		{
+			ks_reduce[block.thread_rank()] = dKs;
+			block.sync();
+
+			for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1)
+			{
+				if (block.thread_rank() < stride)
+					ks_reduce[block.thread_rank()] += ks_reduce[block.thread_rank() + stride];
+				block.sync();
+			}
+
+			if (block.thread_rank() == 0)
+				atomicAdd(&dL_dkspecular[0], ks_reduce[0]);
+		}
+	#endif
+
+	#if LIGHT_ENABLE_BWD && LIGHT_USE_PHONG && (LIGHT_PHONG_SHININESS_MODE == 1)
+	{
+		shiny_reduce[block.thread_rank()] = dSh;
+		block.sync();
+
+		for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1) {
+			if (block.thread_rank() < stride)
+				shiny_reduce[block.thread_rank()] += shiny_reduce[block.thread_rank() + stride];
+			block.sync();
+		}
+		if (block.thread_rank() == 0)
+			atomicAdd(&dL_dshiny[0], shiny_reduce[0]);
+	}
+	#endif
 }
 
 __device__ void compute_transmat_aabb(
@@ -950,6 +951,8 @@ void BACKWARD::render(
 	const float4* normal_opacity,
 	const float* colors,
 	const float* ambients,
+	const float* kspecular,
+	const float* shiny,
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
@@ -961,7 +964,9 @@ void BACKWARD::render(
 	float* dL_dnormal3D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dambient)
+	float* dL_dambient,
+	float* dL_dkspecular,
+	float* dL_dshiny)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -974,6 +979,8 @@ void BACKWARD::render(
 		transMats,
 		colors,
 		ambients,
+		kspecular,
+		shiny,
 		depths,
 		final_Ts,
 		n_contrib,
@@ -984,6 +991,8 @@ void BACKWARD::render(
 		dL_dnormal3D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_dambient
+		dL_dambient,
+		dL_dkspecular,
+		dL_dshiny
 		);
 }
