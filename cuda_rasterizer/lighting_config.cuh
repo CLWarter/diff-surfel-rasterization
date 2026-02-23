@@ -83,6 +83,17 @@
 #define LIGHT_PHONG_SHININESS 8.0f
 #endif
 
+// --------------------- Intensity ---------------------
+
+// Spotlight params
+#ifndef FALLOFF_MODE
+#define FALLOFF_MODE 1  // 0 = none, 1 = quadratic
+#endif
+
+#ifndef FALLOFF_K
+#define FALLOFF_K 0.1f // or 1.0?
+#endif
+
 // ------------------ Specular gating ------------------
 // 0 = none
 // 1 = backface gate only: spec = 0 if ndotl <= 0

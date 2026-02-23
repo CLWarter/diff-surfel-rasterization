@@ -7,6 +7,8 @@ struct LightingOut {
     float spec_add;    // additive spec
     float lambert;     // lambert tern
     float ndotl;       // n*L
+    float intensity;
+    float dintensity_dz;
     float spot;        // spotlight factor
     float ambient;     // ambient value
     float kspec;       // specular factor
@@ -57,6 +59,20 @@ float3 compute_light_dir(const float2& pixf,
     return v;
 }
 
+__device__ __forceinline__ float distance_attenuation(float d, int mode, float k) {
+    if (mode == 0) return 1.0f;
+    // mode 1: quadratic
+    return 1.0f / (1.0f + k * d * d);
+}
+
+__device__ __forceinline__ float inv_quadratic_falloff(float d)
+{
+    // Hardcode for now (your “no dynamic config” branch)
+    // k controls how fast it falls off; tune later
+    const float k = 0.15f;
+    return 1.0f / (1.0f + k * d * d);
+}
+
 __device__ __forceinline__ float sigmoidf_stable(float x)
 {
     // stable sigmoid avoids exp overflow
@@ -92,7 +108,9 @@ __device__ __forceinline__ float ambient_value(const float* __restrict__ ambient
     (void)ambients;
     return LIGHT_AMBIENT_FIXED;
 #else
-    return sigmoidf_stable(ambients[0]);
+    const float amax = 0.25f;
+    float t = sigmoidf_stable(ambients[0]);
+    return amax * t;
 #endif
 }
 
@@ -128,7 +146,8 @@ __device__ __forceinline__ float spotlight_factor(const float3& light_dir_cam_to
     const float innerCos = cosf(LIGHT_SPOT_INNER_DEG * (LIGHT_PI / 180.f));
     const float outerCos = cosf(LIGHT_SPOT_OUTER_DEG * (LIGHT_PI / 180.f));
 
-    float t = (cosTheta - outerCos) / (innerCos - outerCos);
+    float denom = fmaxf(innerCos - outerCos, 1e-6f);
+    float t = (cosTheta - outerCos) / denom;
     float s = smoothstep01(t);
     if (LIGHT_SPOT_EXP != 1.0f) s = powf(s, LIGHT_SPOT_EXP);
     return s;
@@ -144,6 +163,7 @@ LightingOut eval_lighting(
     int W, int H,
     float focal_x, float focal_y,
     float3 n_raw,
+    float depth_cam,
     const float* __restrict__ ambients,
     const float* __restrict__ kspecs,
     const float* __restrict__ shiny
@@ -153,6 +173,7 @@ LightingOut eval_lighting(
     o.spec_add    = 0.0f;
     o.lambert     = 1.0f;
     o.ndotl       = 1.0f;
+    o.intensity   = 1.0f;
     o.spot        = 1.0f;
     o.ambient     = 0.0f;
 
@@ -185,11 +206,29 @@ LightingOut eval_lighting(
 #endif
     o.lambert = lambert;
 
+    float dz = fmaxf(fabsf(light_dir.z), 1e-6f);
+    float dist = fabsf(depth_cam) / dz;
+    dist = fmaxf(dist, 1e-6f);
+
+    const float I = 1.0f;
+    const float k = FALLOFF_K;
+
+    float denom = 1.0f + k * dist * dist;
+    float inv   = 1.0f / denom;
+
+    float Li = I * inv;
+    float dLi_dd = I * (-2.0f * k * dist) * (inv * inv);
+
+    float dLi_dz = dLi_dd * (1.0f / dz);
+
+    o.intensity = Li;
+    o.dintensity_dz = dLi_dz;
+
     float a = ambient_value(ambients);
     o.ambient = a;
 
 #if LIGHT_USE_LAMBERT
-    float diffuse = a + (1.0f - a) * lambert * spot;
+    float diffuse = a + (1.0f - a) * lambert * spot * Li;
     o.diffuse_base = diffuse;
 #else
     // Phong-only: base color
@@ -201,7 +240,6 @@ LightingOut eval_lighting(
     float3 Hh = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
     Hh = normalize_or_default(Hh, make_float3(0.f,0.f,-1.f));
     float ndoth = fmaxf(n.x*Hh.x + n.y*Hh.y + n.z*Hh.z, 0.0f);
-    float specular = (ndoth > 0.0f) ? powf(ndoth, LIGHT_PHONG_SHININESS) : 0.0f;
 
     float ks = kspec_value(kspecs);
 
@@ -221,7 +259,7 @@ LightingOut eval_lighting(
     o.ndoth = ndoth_clamped;
     o.spec_pow = spec_pow;
 
-    float spec_base = spec_pow * spot;
+    float spec_base = spec_pow * spot * Li;
 
     #if (LIGHT_SPEC_GATING == 1)
             if (ndotl <= 0.0f) spec_base = 0.0f;

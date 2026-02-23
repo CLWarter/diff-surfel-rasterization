@@ -346,7 +346,7 @@ renderCUDA(
 			#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, ambients, kspecular, shiny);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, kspecular, shiny);
 
 				const float w = alpha * T;
 				const float dchannel_dcolor = w * Lout.diffuse_mul;
@@ -394,15 +394,15 @@ renderCUDA(
 			// ---------- Ambient gradient (learned only) ----------
 			#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
 			{
-				float d_diffuse_da = 1.0f - (Lout.lambert * Lout.spot);
+				float d_diffuse_da = 1.0f - (Lout.lambert * Lout.spot * Lout.intensity);
 
 				#if LIGHT_ENERGY_COMP
 					d_diffuse_da *= (1.0f - Lout.kspec);
 				#endif
 
-				float a = Lout.ambient;
-				float da_draw = a * (1.0f - a);
-
+				const float amax = 0.25f;
+				float t = sigmoidf_stable(ambients[0]);
+				float da_draw = amax * t * (1.0f - t);
 				dAmb += dL_ddiffuse_shading * d_diffuse_da * da_draw;
 			}
 			#endif
@@ -457,7 +457,7 @@ renderCUDA(
 						a = LIGHT_AMBIENT_FIXED;
 					#endif
 
-					float dL_dlambert = dL_ddiffuse * (1.0f - a) * Lout.spot;
+					float dL_dlambert = dL_ddiffuse * (1.0f - a) * Lout.spot * Lout.intensity;
 
 					#if LIGHT_ENERGY_COMP
 						dL_dlambert *= (1.0f - Lout.kspec);
@@ -495,9 +495,9 @@ renderCUDA(
 
 					float ndoth = n_unit.x*Hh.x + n_unit.y*Hh.y + n_unit.z*Hh.z;
 					if (ndoth > 0.0f) {
-						float spec_deriv = LIGHT_PHONG_SHININESS * powf(ndoth, LIGHT_PHONG_SHININESS - 1.0f);
+						float spec_deriv = Lout.shiny * powf(ndoth, Lout.shiny - 1.0f);
 
-						float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot;
+						float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot * Lout.intensity;
 
 						#if (LIGHT_SPEC_GATING == 1)
 							if (Lout.ndotl <= 0.0f) dspec_dndoth = 0.0f;
