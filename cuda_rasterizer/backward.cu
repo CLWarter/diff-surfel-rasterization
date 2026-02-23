@@ -259,12 +259,10 @@ renderCUDA(
 
 	// per-thread accumulators
 	float dAmb = 0.0f;
-	float dKs = 0.0f;
 	float dSh = 0.0f;
 
 	// shared buffers for block reduction
 	__shared__ float amb_reduce[BLOCK_SIZE];
-	__shared__ float ks_reduce[BLOCK_SIZE];
 	__shared__ float shiny_reduce[BLOCK_SIZE];
 
 	// Traverse all Gaussians
@@ -346,7 +344,8 @@ renderCUDA(
 			#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, kspecular, shiny);
+				const float* ks_ptr = kspecular + global_id;   // per-gaussian
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, ks_ptr, shiny);
 
 				const float w = alpha * T;
 				const float dchannel_dcolor = w * Lout.diffuse_mul;
@@ -422,7 +421,7 @@ renderCUDA(
 
 				const float dL_dks = dL_dspec_add * dspecadd_dks + dL_ddiffuse_mul * ddiffmul_dks;
 
-				dKs += dL_dks * Lout.dkspecular;
+				atomicAdd(&dL_dkspecular[global_id], dL_dks * Lout.dkspecular);
 			}
 			#endif
 
@@ -663,23 +662,6 @@ renderCUDA(
 		if (block.thread_rank() == 0)
 			atomicAdd(&dL_dambients[0], amb_reduce[0]);
 	}
-	#endif
-
-	#if LIGHT_ENABLE_BWD && LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
-		{
-			ks_reduce[block.thread_rank()] = dKs;
-			block.sync();
-
-			for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1)
-			{
-				if (block.thread_rank() < stride)
-					ks_reduce[block.thread_rank()] += ks_reduce[block.thread_rank() + stride];
-				block.sync();
-			}
-
-			if (block.thread_rank() == 0)
-				atomicAdd(&dL_dkspecular[0], ks_reduce[0]);
-		}
 	#endif
 
 	#if LIGHT_ENABLE_BWD && LIGHT_USE_PHONG && (LIGHT_PHONG_SHININESS_MODE == 1)

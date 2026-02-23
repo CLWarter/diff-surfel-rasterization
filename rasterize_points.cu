@@ -205,7 +205,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dnormal = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dambients = torch::zeros({1, 1}, means3D.options());
-  torch::Tensor dL_dkspecular = torch::zeros({1, 1}, means3D.options());
+  torch::Tensor dL_dkspecular = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dshiny = torch::zeros({1, 1}, means3D.options());
   torch::Tensor dL_dtransMat = torch::zeros({P, 9}, means3D.options());
   torch::Tensor dL_dsh = torch::zeros({P, M, 3}, means3D.options());

@@ -404,7 +404,9 @@ renderCUDA(
 
 			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, kspecular, shiny);
+				const int gid = collected_id[j];
+				const float* ks_ptr = kspecular + gid;   // per-gaussian
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, ks_ptr, shiny);
 
 				w_diff = w * Lout.diffuse_mul;
 
