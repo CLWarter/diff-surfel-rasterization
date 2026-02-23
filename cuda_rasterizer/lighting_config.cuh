@@ -124,3 +124,24 @@ __device__ __forceinline__ bool light_use_phong(const LightingConfig& c) {
 }
 
 #endif
+
+#define CUDA_CHECK(stmt) \
+  do { \
+    cudaError_t __err = (stmt); \
+    if (__err != cudaSuccess) { \
+      printf("CUDA_CHECK failed %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(__err)); \
+      return; \
+    } \
+  } while(0)
+
+#define CUDA_SYNC_CHECK() \
+  do { \
+    cudaError_t __err = cudaGetLastError(); \
+    if (__err != cudaSuccess) { \
+      printf("cudaGetLastError %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(__err)); \
+    } \
+    __err = cudaDeviceSynchronize(); \
+    if (__err != cudaSuccess) { \
+      printf("cudaDeviceSynchronize %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(__err)); \
+    } \
+  } while(0)

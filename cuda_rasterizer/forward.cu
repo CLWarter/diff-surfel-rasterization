@@ -449,8 +449,8 @@ renderCUDA(
 			}
 
 			// Specular added to RGB
-			for (int k = 0; k < CHANNELS; k++)
-				C[k] += w_spec * features[collected_id[k] * CHANNELS + k];
+			for (int ch = 0; ch < CHANNELS; ch++)
+				C[ch] += w_spec * features[collected_id[j] * CHANNELS + ch];
 
 			T = test_T;
 
@@ -519,11 +519,7 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		out_others);
-	cudaDeviceSynchronize();
-	cudaError_t err = cudaGetLastError();
-	if (err != cudaSuccess) {
-		printf("Error right after render kernel: %s\n", cudaGetErrorString(err));
-	}
+	CUDA_SYNC_CHECK();
 }
 
 void FORWARD::preprocess(int P, int D, int M,

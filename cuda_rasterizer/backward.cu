@@ -939,9 +939,5 @@ void BACKWARD::render(
 		dL_dcolors,
 		dL_dambient,
 		dL_dkspecular);
-	cudaDeviceSynchronize();
-	cudaError_t err = cudaGetLastError();
-	if (err != cudaSuccess) {
-		printf("Error right after render kernel: %s\n", cudaGetErrorString(err));
-	}
+	CUDA_SYNC_CHECK();
 }

@@ -36,7 +36,7 @@ void SetLightingConfigCUDA(torch::Tensor cfg_tensor_cpu)
 
     const float* p = cfg_tensor_cpu.data_ptr<float>();
 
-    LightingConfig cfg;
+    LightingConfig cfg{};
     cfg.enable_fwd       = (int32_t)p[I_ENABLE_FWD];
     cfg.enable_bwd       = (int32_t)p[I_ENABLE_BWD];
     cfg.light_mode       = (int32_t)p[I_LIGHT_MODE];
