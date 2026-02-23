@@ -30,7 +30,7 @@ def rasterize_gaussians(
     scales,
     rotations,
     cov3Ds_precomp,
-    raster_settings
+    raster_settings,
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -43,7 +43,7 @@ def rasterize_gaussians(
         scales,
         rotations,
         cov3Ds_precomp,
-        raster_settings
+        raster_settings,
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -60,7 +60,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         scales,
         rotations,
         cov3Ds_precomp,
-        raster_settings
+        raster_settings,
     ):
 
         # Restructure arguments the way that the C++ lib expects them
@@ -234,6 +234,6 @@ class GaussianRasterizer(nn.Module):
             scales, 
             rotations,
             cov3D_precomp,
-            raster_settings
+            raster_settings,
         )
 

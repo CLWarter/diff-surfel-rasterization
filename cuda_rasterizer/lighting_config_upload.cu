@@ -4,11 +4,6 @@
 #include "lighting_config.cuh"
 #include "lighting_config_upload.cuh"
 
-__device__ __constant__ LightingConfig d_lighting_cfg;
-
-__device__ const LightingConfig& get_lighting_cfg_ref() {
-  return d_lighting_cfg;
-}
 
 // Layout indices (sync with python)
 enum {

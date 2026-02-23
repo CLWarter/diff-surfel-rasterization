@@ -135,6 +135,11 @@ RasterizeGaussiansCUDA(
 		out_others.contiguous().data<float>(),
 		radii.contiguous().data<int>(),
 		debug);
+
+		cudaError_t err = cudaDeviceSynchronize();
+		if (err != cudaSuccess) {
+			AT_ERROR("CUDA error after forward: ", cudaGetErrorString(err));
+		}
   }
   return std::make_tuple(rendered, out_color, out_others, radii, geomBuffer, binningBuffer, imgBuffer);
 }

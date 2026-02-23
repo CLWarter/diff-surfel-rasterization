@@ -12,6 +12,7 @@
 #include "backward.h"
 #include "auxiliary.h"
 #include "lighting.cuh"
+#include "lighting_config_upload.cuh"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -184,7 +185,7 @@ renderCUDA(
 	bool done = !inside;
 	int toDo = range.y - range.x;
 
-	const LightingConfig cfg& = get_lighting_cfg();
+	const LightingConfig cfg = get_lighting_cfg();
 
 	const bool useLambert = light_use_lambert(cfg);
 	const bool usePhong   = light_use_phong(cfg);
@@ -937,6 +938,10 @@ void BACKWARD::render(
 		dL_dopacity,
 		dL_dcolors,
 		dL_dambient,
-		dL_dkspecular
-		);
+		dL_dkspecular);
+	cudaDeviceSynchronize();
+	cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		printf("Error right after render kernel: %s\n", cudaGetErrorString(err));
+	}
 }

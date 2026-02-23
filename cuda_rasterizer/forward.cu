@@ -13,6 +13,7 @@
 #include "auxiliary.h"
 #include "lighting.cuh"
 #include "lighting_config.cuh"
+#include "lighting_config_upload.cuh"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -290,7 +291,7 @@ renderCUDA(
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 	
-	const LightingConfig cfg& = get_lighting_cfg();
+	const LightingConfig cfg = get_lighting_cfg();
 
 	const bool useLambert = light_use_lambert(cfg);
 	const bool usePhong   = light_use_phong(cfg);
@@ -448,8 +449,8 @@ renderCUDA(
 			}
 
 			// Specular added to RGB
-			for (i = 0; i < NUM_CHANNELS; i++)
-				C[i] += w_spec * features[collected_id[i] * CHANNELS + i];
+			for (int k = 0; k < CHANNELS; k++)
+				C[k] += w_spec * features[collected_id[k] * CHANNELS + k];
 
 			T = test_T;
 
@@ -518,6 +519,11 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		out_others);
+	cudaDeviceSynchronize();
+	cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		printf("Error right after render kernel: %s\n", cudaGetErrorString(err));
+	}
 }
 
 void FORWARD::preprocess(int P, int D, int M,

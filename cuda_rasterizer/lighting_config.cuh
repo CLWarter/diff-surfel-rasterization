@@ -110,7 +110,7 @@ struct LightingConfig {
 
 #ifdef __CUDACC__
 
-__device__ const LightingConfig& d_lighting_cfg;
+__constant__ LightingConfig d_lighting_cfg;
 
 __device__ __forceinline__ LightingConfig get_lighting_cfg() {
   return d_lighting_cfg;

@@ -10,6 +10,7 @@
  */
 
 #include "rasterizer_impl.h"
+#include <torch/extension.h>
 #include <iostream>
 #include <fstream>
 #include <algorithm>
@@ -21,7 +22,6 @@
 #include <cub/device/device_radix_sort.cuh>
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
-
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
