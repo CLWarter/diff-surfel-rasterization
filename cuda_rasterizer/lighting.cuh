@@ -125,14 +125,15 @@ float kspec_value(const float* kspecs)
 #endif
 }
 
-__device__ __forceinline__ float shininess_value(const float* shiny_raw, float* dshin_raw_out)
+__device__ __forceinline__ float shininess_value(const float* shiny_raw, float* dshin_draw_out)
 {
 #if (LIGHT_PHONG_SHININESS_MODE == 1)
-    float t = sigmoidf_stable(shiny_raw[0]);        // in (0,1)
-    if (dshin_raw_out) *dshin_raw_out = t * (1.0f - t); // dt/draw
+    float t = sigmoidf_stable(shiny_raw[0]);  // in (0,1)
+    if (dshin_draw_out)
+        *dshin_draw_out = (LIGHT_SHINY_MAX - LIGHT_SHINY_MIN) * t * (1.0f - t);
     return LIGHT_SHINY_MIN + (LIGHT_SHINY_MAX - LIGHT_SHINY_MIN) * t;
 #else
-    if (dshin_raw_out) *dshin_raw_out = 0.0f;
+    if (dshin_draw_out) *dshin_draw_out = 0.0f;
     return LIGHT_PHONG_SHININESS;
 #endif
 }
@@ -248,14 +249,14 @@ LightingOut eval_lighting(
         dkspecular = ks * (1.0f - ks);
     #endif
 
-    float dshin_dt = 0.0f;
-    float shin = shininess_value(shiny, &dshin_dt);
+    float dshin_draw = 0.0f;
+    float shin = shininess_value(shiny, &dshin_draw);
 
     float ndoth_clamped = fmaxf(n.x*Hh.x + n.y*Hh.y + n.z*Hh.z, 0.0f);
     float spec_pow = (ndoth_clamped > 0.0f) ? powf(ndoth_clamped, shin) : 0.0f;
 
     o.shiny = shin;
-    o.dshin_raw = dshin_dt * (LIGHT_SHINY_MAX - LIGHT_SHINY_MIN); // dshin/draw
+    o.dshin_raw = dshin_draw;
     o.ndoth = ndoth_clamped;
     o.spec_pow = spec_pow;
 
