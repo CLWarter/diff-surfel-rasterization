@@ -207,6 +207,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* colors_precomp,
 	const float* opacities,
 	const float* ambients,
+	const float* intensity,
 	const float* kspecular,
 	const float* shiny,
 	const float* scales,
@@ -333,6 +334,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		feature_ptr,
 		ambients,
+		intensity,
 		kspecular,
 		shiny,
 		transMat_ptr,
@@ -357,6 +359,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* shs,
 	const float* colors_precomp,
 	const float* ambients,
+	const float* intensity,
 	const float* kspecular,
 	const float* shiny,
 	const float* scales,
@@ -378,6 +381,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dopacity,
 	float* dL_dcolor,
 	float* dL_dambient,
+	float* dL_dintensity,
 	float* dL_dkspecular,
 	float* dL_dshiny,
 	float* dL_dmean3D,
@@ -420,6 +424,7 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.normal_opacity,
 		color_ptr,
 		ambients,
+		intensity,
 		kspecular,
 		shiny,
 		transMat_ptr,
@@ -432,7 +437,7 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D,
 		dL_dnormal,
 		dL_dopacity,
-		dL_dcolor, dL_dambient, dL_dkspecular, dL_dshiny), debug)
+		dL_dcolor, dL_dambient, dL_dintensity, dL_dkspecular, dL_dshiny), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

@@ -43,6 +43,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& colors,
 	const torch::Tensor& opacity,
 	const torch::Tensor& ambients,
+	const torch::Tensor& intensity,
 	const torch::Tensor& kspecular,
 	const torch::Tensor& shiny,
 	const torch::Tensor& scales,
@@ -75,6 +76,7 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(colors);
   CHECK_INPUT(opacity);
   CHECK_INPUT(ambients);
+  CHECK_INPUT(intensity);
   CHECK_INPUT(kspecular);
   CHECK_INPUT(shiny);
   CHECK_INPUT(scales);
@@ -122,6 +124,7 @@ RasterizeGaussiansCUDA(
 		colors.contiguous().data<float>(), 
 		opacity.contiguous().data<float>(), 
 		ambients.contiguous().data<float>(), 
+		intensity.contiguous().data<float>(), 
 		kspecular.contiguous().data<float>(),
 		shiny.contiguous().data<float>(),
 		scales.contiguous().data_ptr<float>(),
@@ -142,13 +145,14 @@ RasterizeGaussiansCUDA(
   return std::make_tuple(rendered, out_color, out_others, radii, geomBuffer, binningBuffer, imgBuffer);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
 	const torch::Tensor& radii,
 	const torch::Tensor& colors,
 	const torch::Tensor& ambients,
+	const torch::Tensor& intensity,
 	const torch::Tensor& kspecular,
 	const torch::Tensor& shiny,
 	const torch::Tensor& scales,
@@ -176,6 +180,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   CHECK_INPUT(radii);
   CHECK_INPUT(colors);
   CHECK_INPUT(ambients);
+  CHECK_INPUT(intensity);
   CHECK_INPUT(kspecular);
   CHECK_INPUT(shiny);
   CHECK_INPUT(scales);
@@ -205,6 +210,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dnormal = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dambients = torch::zeros({1, 1}, means3D.options());
+  torch::Tensor dL_dintensity = torch::zeros({1, 1}, means3D.options());
   torch::Tensor dL_dkspecular = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dshiny = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dtransMat = torch::zeros({P, 9}, means3D.options());
@@ -213,7 +219,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
   
   if(P != 0)
-  {  
+  { 
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 	  background.contiguous().data<float>(),
 	  W, H, 
@@ -221,6 +227,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  sh.contiguous().data<float>(),
 	  colors.contiguous().data<float>(),
 	  ambients.contiguous().data<float>(),
+	  intensity.contiguous().data<float>(),
 	  kspecular.contiguous().data<float>(),
 	  shiny.contiguous().data<float>(),
 	  scales.data_ptr<float>(),
@@ -243,6 +250,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dopacity.contiguous().data<float>(),
 	  dL_dcolors.contiguous().data<float>(),
 	  dL_dambients.contiguous().data<float>(),
+	  dL_dintensity.contiguous().data<float>(),
 	  dL_dkspecular.contiguous().data<float>(),
 	  dL_dshiny.contiguous().data<float>(),
 	  dL_dmeans3D.contiguous().data<float>(),
@@ -253,7 +261,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  debug);
   }
 
-  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dambients, dL_dkspecular, dL_dshiny, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations);
+  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dambients, dL_dintensity, dL_dkspecular, dL_dshiny, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations);
 }
 
 torch::Tensor markVisible(

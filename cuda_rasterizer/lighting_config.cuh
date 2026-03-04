@@ -70,7 +70,9 @@
 
 // 0 = fixed LIGHT_PHONG_SHININESS define
 // 1 = learned per-scene shininess (scalar in [SHINY_MIN, SHINY_MAX])
+#ifndef LIGHT_PHONG_SHININESS_MODE
 #define LIGHT_PHONG_SHININESS_MODE 1
+#endif
 
 #define LIGHT_SHINY_MIN  2.0f
 #define LIGHT_SHINY_MAX  128.0f
@@ -92,6 +94,14 @@
 
 #ifndef FALLOFF_K
 #define FALLOFF_K 0.1f // or 1.0?
+#endif
+
+#ifndef FALLOFF_Z_GRAD_SCALE
+#define FALLOFF_Z_GRAD_SCALE 0.00f   // prevent depth hacks
+#endif
+
+#ifndef FALLOFF_Z_GRAD_CLAMP
+#define FALLOFF_Z_GRAD_CLAMP 0.01f   // clamp added contribution to dL_dz
 #endif
 
 // ------------------ Specular gating ------------------

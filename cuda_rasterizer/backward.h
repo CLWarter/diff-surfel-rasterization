@@ -32,6 +32,7 @@ namespace BACKWARD
 		const float* transMats,
 		const float* colors,
 		const float* ambients,
+		const float* intensity,
 		const float* kspecular,
 		const float* shiny,
 		const float* depths,
@@ -45,6 +46,7 @@ namespace BACKWARD
 		float* dL_dopacity,
 		float* dL_dcolors,
 		float* dL_dambient,
+		float* dL_dintensity,
 		float* dL_dkspecular,
 		float* dL_dshiny);
 

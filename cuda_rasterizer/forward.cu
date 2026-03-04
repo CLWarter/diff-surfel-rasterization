@@ -265,6 +265,7 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ ambients,
+	const float* __restrict__ intensity,
 	const float* __restrict__ kspecular,
 	const float* __restrict__ shiny,
 	const float* __restrict__ transMats,
@@ -407,7 +408,7 @@ renderCUDA(
 				const int gid = collected_id[j];
 				const float* ks_ptr = kspecular + gid;   // per-gaussian
 				const float* shi_ptr = shiny + gid;
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, ks_ptr, shi_ptr);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr);
 
 				w_diff = w * Lout.diffuse_mul;
 
@@ -444,9 +445,9 @@ renderCUDA(
 
 			// Specular added to RGB
 			#if LIGHT_USE_PHONG
-				C[0] += w_spec * features[collected_id[j] * CHANNELS + 0];
-				C[1] += w_spec * features[collected_id[j] * CHANNELS + 1];
-				C[2] += w_spec * features[collected_id[j] * CHANNELS + 2];
+				C[0] += w_spec;
+				C[1] += w_spec;
+				C[2] += w_spec;
 			#endif
 
 			T = test_T;
@@ -489,6 +490,7 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float* ambients,
+	const float* intensity,
 	const float* kspecular,
 	const float* shiny,
 	const float* transMats,
@@ -508,6 +510,7 @@ void FORWARD::render(
 		means2D,
 		colors,
 		ambients,
+		intensity,
 		kspecular,
 		shiny,
 		transMats,
