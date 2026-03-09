@@ -234,7 +234,7 @@ LightingOut eval_lighting(
     const float* __restrict__ intensity,
     const float* __restrict__ kspecs,
     const float* __restrict__ shiny,
-    const float3* center_cam_opt = nullptr
+    const float3* point_cam_opt = nullptr
 ) {
     LightingOut o = {};
     // defaults (no lighting)
@@ -266,14 +266,14 @@ LightingOut eval_lighting(
     // Default = old depth-based hitpoint reconstruction
     // Option C = use Gaussian center in camera space
     // ------------------------------------------------------------
-    const bool use_center_cam = (center_cam_opt != nullptr);
+    const bool use_point_cam = (point_cam_opt != nullptr);
 
     float3 P;        // point in camera space
     float3 view_ray; // camera -> surface direction, normalized
 
-    if (use_center_cam)
+    if (use_point_cam)
     {
-        P = *center_cam_opt;
+        P = *point_cam_opt;
         view_ray = normalize_or_default(P, make_float3(0.f, 0.f, 1.f));
     }
     else
@@ -344,7 +344,7 @@ LightingOut eval_lighting(
                             P.y - light_pos.y,
                             P.z - light_pos.z);
 
-    float dist2 = fmaxf(LP.x * LP.x + LP.y * LP.y + LP.z * LP.z, 1e-12f);
+    float dist2 = fmaxf(LP.x * LP.x + LP.y * LP.y + LP.z * LP.z, 1e-4f);
 
 #if (FALLOFF_MODE == 0)
     inv = 1.0f;
@@ -354,7 +354,7 @@ LightingOut eval_lighting(
     const float k = FALLOFF_K;
     inv = 1.0f / (1.0f + k * dist2);
 
-    if (!use_center_cam)
+    if (!use_point_cam)
     {
         // old depth-based derivative path
         float3 r = compute_ray_unnorm(pixf, W, H, focal_x, focal_y);

@@ -83,12 +83,25 @@ __device__ void compute_transmat(
 	const int W,
 	const int H, 
 	glm::mat3 &T,
-	float3 &normal
+	float3 &normal,
+	float3& bu_cam,
+	float3& bv_cam
 ) {
-
 	glm::mat3 R = quat_to_rotmat(rot);
 	glm::mat3 S = scale_to_mat(scale, mod);
 	glm::mat3 L = R * S;
+
+	float3 p_view = transformPoint4x3(p_orig, viewmatrix);
+
+	bu_cam = transformVec4x3(
+		make_float3(L[0].x, L[0].y, L[0].z),
+		viewmatrix
+	);
+
+	bv_cam = transformVec4x3(
+		make_float3(L[1].x, L[1].y, L[1].z),
+		viewmatrix
+	);
 
 	// center of Gaussians in the camera coordinate
 	glm::mat3x4 splat2world = glm::mat3x4(
@@ -111,6 +124,7 @@ __device__ void compute_transmat(
 	);
 
 	T = glm::transpose(splat2world) * world2ndc * ndc2pix;
+
 	normal = transformVec4x3({L[2].x, L[2].y, L[2].z}, viewmatrix);
 
 }
@@ -167,6 +181,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float2* points_xy_image,
 	float* depths,
 	float3* means3D_cam,
+	float3* basis_u_cam,
+    float3* basis_v_cam,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
@@ -191,9 +207,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Compute transformation matrix
 	glm::mat3 T;
 	float3 normal;
+	float3 bu_cam = make_float3(0.0f, 0.0f, 0.0f);
+	float3 bv_cam = make_float3(0.0f, 0.0f, 0.0f);
+
 	if (transMat_precomp == nullptr)
 	{
-		compute_transmat(((float3*)orig_points)[idx], scales[idx], scale_modifier, rotations[idx], projmatrix, viewmatrix, W, H, T, normal);
+		compute_transmat(((float3*)orig_points)[idx], scales[idx], scale_modifier, rotations[idx], projmatrix, viewmatrix, W, H, T, normal, bu_cam, bv_cam);
 		float3 *T_ptr = (float3*)transMats;
 		T_ptr[idx * 3 + 0] = {T[0][0], T[0][1], T[0][2]};
 		T_ptr[idx * 3 + 1] = {T[1][0], T[1][1], T[1][2]};
@@ -206,6 +225,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 			T_ptr[idx * 3 + 2]
 		);
 		normal = make_float3(0.0, 0.0, 1.0);
+
+		bu_cam = make_float3(0.0f, 0.0f, 0.0f);
+		bv_cam = make_float3(0.0f, 0.0f, 0.0f);
 	}
 
 #if DUAL_VISIABLE
@@ -247,6 +269,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	depths[idx] = p_view.z;
 	means3D_cam[idx] = p_view;
+	basis_u_cam[idx] = bu_cam;
+	basis_v_cam[idx] = bv_cam;
 	radii[idx] = (int)radius;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
@@ -274,6 +298,8 @@ renderCUDA(
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
 	const float3* __restrict__ means3D_cam,
+	const float3* __restrict__ basis_u_cam,
+    const float3* __restrict__ basis_v_cam,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -308,6 +334,8 @@ renderCUDA(
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
 
 	__shared__ float3 collected_center_cam[BLOCK_SIZE];
+	__shared__ float3 collected_basis_u_cam[BLOCK_SIZE];
+	__shared__ float3 collected_basis_v_cam[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -350,6 +378,8 @@ renderCUDA(
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
 			
 			collected_center_cam[block.thread_rank()] = means3D_cam[coll_id];
+			collected_basis_u_cam[block.thread_rank()] = basis_u_cam[coll_id];
+    		collected_basis_v_cam[block.thread_rank()] = basis_v_cam[coll_id];
 		}
 		block.sync();
 
@@ -367,6 +397,8 @@ renderCUDA(
 
 			// NEW: Gaussian center in camera space for stable falloff
 			const float3 center_cam = collected_center_cam[j];
+			const float3 bu_cam = collected_basis_u_cam[j];
+			const float3 bv_cam = collected_basis_v_cam[j];
 
 			// Transform the two planes into local u-v system. 
 			float3 k = pix.x * Tw - Tu;
@@ -381,6 +413,20 @@ renderCUDA(
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
 			float rho = min(rho3d, rho2d);
+
+			bool reliable_hit = (rho3d <= rho2d);
+
+			const float uv_clamp = 3.0f;
+			float sx = fmaxf(-uv_clamp, fminf(s.x, uv_clamp));
+			float sy = fmaxf(-uv_clamp, fminf(s.y, uv_clamp));
+
+			float3 hit_cam = make_float3(
+				center_cam.x + sx * bu_cam.x + sy * bv_cam.x,
+				center_cam.y + sx * bu_cam.y + sy * bv_cam.y,
+				center_cam.z + sx * bu_cam.z + sy * bv_cam.z
+			);
+
+			float3 point_cam = reliable_hit ? hit_cam : center_cam;
 
 			// compute depth
 			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
@@ -421,7 +467,7 @@ renderCUDA(
 				const float* ks_ptr = kspecular + gid;   // per-gaussian
 				const float* shi_ptr = shiny + gid;
 
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &center_cam);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
 
 				w_diff = w * Lout.diffuse_mul;
 
@@ -510,6 +556,8 @@ void FORWARD::render(
 	const float* depths,
 	const float4* normal_opacity,
 	const float3* means3D_cam,
+	const float3* basis_u_cam,
+    const float3* basis_v_cam,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -531,6 +579,8 @@ void FORWARD::render(
 		depths,
 		normal_opacity,
 		means3D_cam,
+		basis_u_cam,
+		basis_v_cam,
 		final_T,
 		n_contrib,
 		bg_color,
@@ -558,6 +608,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	float2* means2D,
 	float* depths,
 	float3* means3D_cam,
+	float3* basis_u_cam,
+    float3* basis_v_cam,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
@@ -586,6 +638,8 @@ void FORWARD::preprocess(int P, int D, int M,
 		means2D,
 		depths,
 		means3D_cam,
+		basis_u_cam,
+		basis_v_cam,
 		transMats,
 		rgb,
 		normal_opacity,

@@ -37,6 +37,8 @@ namespace BACKWARD
 		const float* shiny,
 		const float* depths,
 		const float3* means3D_cam,
+		const float3* basis_u_cam,
+    	const float3* basis_v_cam,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,

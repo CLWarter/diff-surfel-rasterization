@@ -159,6 +159,8 @@ renderCUDA(
 	const float* __restrict__ shiny,
 	const float* __restrict__ depths,
 	const float3* __restrict__ means3D_cam,
+	const float3* __restrict__ basis_u_cam,
+    const float3* __restrict__ basis_v_cam,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
@@ -200,6 +202,8 @@ renderCUDA(
 	// __shared__ float collected_depths[BLOCK_SIZE];
 
 	__shared__ float3 collected_center_cam[BLOCK_SIZE];
+	__shared__ float3 collected_basis_u_cam[BLOCK_SIZE];
+	__shared__ float3 collected_basis_v_cam[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -286,6 +290,8 @@ renderCUDA(
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
 			collected_center_cam[block.thread_rank()] = means3D_cam[coll_id];
+			collected_basis_u_cam[block.thread_rank()] = basis_u_cam[coll_id];
+    		collected_basis_v_cam[block.thread_rank()] = basis_v_cam[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 				// collected_depths[block.thread_rank()] = depths[coll_id];
@@ -308,6 +314,8 @@ renderCUDA(
 			const float3 Tv = collected_Tv[j];
 			const float3 Tw = collected_Tw[j];
 			const float3 center_cam = collected_center_cam[j];
+			const float3 bu_cam = collected_basis_u_cam[j];
+			const float3 bv_cam = collected_basis_v_cam[j];
 			float3 k = pix.x * Tw - Tu;
 			float3 l = pix.y * Tw - Tv;
 			float3 p = cross(k, l);
@@ -317,6 +325,16 @@ renderCUDA(
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
 			float rho = min(rho3d, rho2d);
+
+			bool reliable_hit = (rho3d <= rho2d);
+
+			float3 hit_cam = make_float3(
+				center_cam.x + s.x * bu_cam.x + s.y * bv_cam.x,
+				center_cam.y + s.x * bu_cam.y + s.y * bv_cam.y,
+				center_cam.z + s.x * bu_cam.z + s.y * bv_cam.z
+			);
+
+			float3 point_cam = reliable_hit ? hit_cam : center_cam;
 
 			// compute depth
 			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]
@@ -360,7 +378,7 @@ renderCUDA(
 				const float* shi_ptr = shiny + global_id;
 
 				// Pass pointers of learned factors, pixel pos, normal, cam params
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr, &center_cam);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
 
 				const float w = alpha * T;
 
@@ -529,14 +547,14 @@ renderCUDA(
 				float3 n_unit = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
 
 				// Same geometry conventions as eval_lighting(..., &center_cam)
-				float3 view_ray = normalize_or_default(center_cam, make_float3(0.f, 0.f, 1.f));
+				float3 view_ray = normalize_or_default(point_cam, make_float3(0.f, 0.f, 1.f));
 
 				const float comp = 0.01f * 0.70710678f;
 				const float3 light_pos = make_float3(-comp, -comp, 0.0f);
 
-				float3 Lvec = make_float3(light_pos.x - center_cam.x,
-										  light_pos.y - center_cam.y,
-										  light_pos.z - center_cam.z);
+				float3 Lvec = make_float3(light_pos.x - point_cam.x,
+										  light_pos.y - point_cam.y,
+										  light_pos.z - point_cam.z);
 				Lvec = normalize_or_default(Lvec, make_float3(0.f, 0.f, -1.f));
 
 				float3 Vvec = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
@@ -1037,6 +1055,8 @@ void BACKWARD::render(
 	const float* transMats,
 	const float* depths,
 	const float3* means3D_cam,
+	const float3* basis_u_cam,
+    const float3* basis_v_cam,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
@@ -1067,6 +1087,8 @@ void BACKWARD::render(
 		shiny,
 		depths,
 		means3D_cam,
+		basis_u_cam,
+		basis_v_cam,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,

@@ -40,6 +40,8 @@ namespace CudaRasterizer
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
 		float3* means3D_cam;
+		float3* basis_u_cam;
+		float3* basis_v_cam;
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
