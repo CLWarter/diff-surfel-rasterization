@@ -421,6 +421,8 @@ renderCUDA(
 			float sx = fmaxf(-uv_clamp, fminf(s.x, uv_clamp));
 			float sy = fmaxf(-uv_clamp, fminf(s.y, uv_clamp));
 
+			bool hit_was_clamped = (fabsf(s.x - sx) > 1e-6f) || (fabsf(s.y - sy) > 1e-6f);
+
 			float3 hit_cam = make_float3(
 				center_cam.x + sx * bu_cam.x + sy * bv_cam.x,
 				center_cam.y + sx * bu_cam.y + sy * bv_cam.y,
@@ -442,6 +444,14 @@ renderCUDA(
 			bool sane_hit = (delta2 <= hit_delta2_max);
 
 			float3 point_cam = (reliable_hit && sane_hit) ? hit_cam : center_cam;
+
+			float surface_conf = 1.0f;
+
+			if (!reliable_hit || !sane_hit)
+				surface_conf *= LIGHT_CONF_FALLBACK;
+
+			if (hit_was_clamped)
+				surface_conf *= LIGHT_CONF_CLAMPED_HIT;
 
 			// compute depth
 			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
@@ -482,7 +492,7 @@ renderCUDA(
 				const float* ks_ptr = kspecular + gid;   // per-gaussian
 				const float* shi_ptr = shiny + gid;
 
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam, surface_conf);
 
 				w_diff = w * Lout.diffuse_mul;
 

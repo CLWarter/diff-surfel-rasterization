@@ -234,7 +234,8 @@ LightingOut eval_lighting(
     const float* __restrict__ intensity,
     const float* __restrict__ kspecs,
     const float* __restrict__ shiny,
-    const float3* point_cam_opt = nullptr
+    const float3* point_cam_opt = nullptr,
+    float surface_conf = 1.0f
 ) {
     LightingOut o = {};
     // defaults (no lighting)
@@ -306,6 +307,27 @@ LightingOut eval_lighting(
     float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
     V = normalize_or_default(V, make_float3(0.f, 0.f, -1.f));
 
+    // Stabilization
+    float nv_raw = fmaxf(-(n.x * view_ray.x + n.y * view_ray.y + n.z * view_ray.z), 0.0f);
+
+    // more stabilization when grazing
+    float t = (nv_raw - LIGHT_NORMAL_GRAZING_END) /
+              (LIGHT_NORMAL_GRAZING_START - LIGHT_NORMAL_GRAZING_END);
+    t = fmaxf(0.0f, fminf(t, 1.0f));
+    float grazing_t = 1.0f - smoothstep01(t);
+
+    // blend slightly toward camera-facing direction
+    float3 n_view = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
+    float blend_w = LIGHT_NORMAL_VIEW_BLEND * grazing_t;
+
+    float3 n_stable = make_float3(
+        (1.0f - blend_w) * n.x + blend_w * n_view.x,
+        (1.0f - blend_w) * n.y + blend_w * n_view.y,
+        (1.0f - blend_w) * n.z + blend_w * n_view.z
+    );
+
+    n = normalize_or_default(n_stable, make_float3(0.f, 0.f, 1.f));
+
     // spotlight cone depends on camera -> surface direction
     float spot = spotlight_factor(view_ray);
     o.spot = spot;
@@ -375,7 +397,7 @@ LightingOut eval_lighting(
     o.inv = inv;
 
     float Li_raw = I * inv;
-    float Li = Li_raw;
+    float Li = Li_raw * surface_conf;
 
 #if (LIGHT_LI_CLAMP > 0)
     if (Li > (float)LIGHT_LI_CLAMP) {
@@ -396,10 +418,11 @@ LightingOut eval_lighting(
     #else
     dkspecular = 0.0f;
   #endif
+    //dkspecular = fminf(dkspecular, 4.0f); // Clamp with 4.0 highest as more would be unrealistic (more for debug)
 
     float dshin_draw = 0.0f;
     float shin = shininess_value(shiny, &dshin_draw);
-    shin = fminf(shin, 64.0f);
+    //shin = fminf(shin, 64.0f); // Clamp with 64.0 highest as more would be unrealistic (mostly for debug)
 
     o.kspec = ks;
     o.dkspecular = dkspecular;
