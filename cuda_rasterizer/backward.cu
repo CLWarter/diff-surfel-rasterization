@@ -435,28 +435,35 @@ renderCUDA(
 				dSpec_dLi = Lout.kspec * base;
 			#endif
 
-				const float dL_dLi = dL_ddiffuse * dDiff_dLi + dL_dspec * dSpec_dLi;
+				float dL_dLi = dL_ddiffuse * dDiff_dLi + dL_dspec * dSpec_dLi;
+
+				// If forward clamped Li, stop gradients through Li to avoid it fighting the clamp
+				float li_grad_gate = 1.0f;
+
+				#if (LIGHT_LI_CLAMP > 0)
+					li_grad_gate = (Lout.li_clamped > 0.5f) ? 0.0f : 1.0f;
+				#endif
 
 				// ---- intensity learnable (per-scene) gradient ----
 				{
 					// Li = I * inv  => dLi/dI = inv
-					float dL_dI    = dL_dLi * Lout.inv;
+					float dL_dI    = (dL_dLi * li_grad_gate) * Lout.inv;
 
 					// I = I_MIN + (I_MAX-I_MIN)*sigmoid(I_raw) -> dI/dI_raw = dI_raw
 					float dL_dIraw = dL_dI * Lout.dI_raw;
 
 					// per-scene scalar gradient
+				#if (LIGHT_INTENSITY_MODE == 1)
 					atomicAdd(&dL_dintensity_raw[0], dL_dIraw);
+				#endif
 				}
 
-				// depth gradient through falloff
-				float contrib = dL_dLi * Lout.dintensity_ddepth;
-
-				// stabilizers to prevent one-view floating splats ----
+			#if FALLOFF_Z_GRAD_ENABLE
+				float contrib = (dL_dLi * li_grad_gate) * Lout.dintensity_ddepth;
 				contrib *= FALLOFF_Z_GRAD_SCALE;
 				contrib = fminf(fmaxf(contrib, -FALLOFF_Z_GRAD_CLAMP), FALLOFF_Z_GRAD_CLAMP);
-
 				dL_dz += contrib;
+			#endif
 			}
 
 			// ---------- Ambient gradient (learned only) ----------
@@ -516,19 +523,27 @@ renderCUDA(
 				// Unit normal used in forward
 				float3 n_unit = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
 
-				// Light direction (must match forward)
-				float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
-				light_dir = normalize_or_default(light_dir, make_float3(0.f,0.f,1.f));
+				// Same view ray as eval_lighting()
+				float3 view_ray = normalize_or_default(
+					make_float3((pixf.x - 0.5f * W) / focal_x,
+								(pixf.y - 0.5f * H) / focal_y,
+								1.0f),
+					make_float3(0.f, 0.f, 1.f)
+				);
 
-				float3 Lvec = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);
-				Lvec = normalize_or_default(Lvec, make_float3(0.f,0.f,-1.f));
+				// L = surface -> light (same as forward)
+				float3 Lvec = compute_light_dir(pixf, W, H, focal_x, focal_y, c_d);
+				Lvec = normalize_or_default(Lvec, make_float3(0.f, 0.f, -1.f));
 
-				// headlight model, V = L (matches forward)
-				float3 Vvec = Lvec;
+				// V = surface -> camera (same as forward)
+				float3 Vvec = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
+				Vvec = normalize_or_default(Vvec, make_float3(0.f, 0.f, -1.f));
 
-				// Half vector for Blinn-Phong
-				float3 Hh = make_float3(Lvec.x + Vvec.x, Lvec.y + Vvec.y, Lvec.z + Vvec.z);
-				Hh = normalize_or_default(Hh, make_float3(0.f,0.f,-1.f));
+				// Half vector (same as forward)
+				float3 Hh = normalize_or_default(
+					make_float3(Lvec.x + Vvec.x, Lvec.y + Vvec.y, Lvec.z + Vvec.z),
+					make_float3(0.f, 0.f, -1.f)
+				);
 
 				float3 g_unit = make_float3(0.f, 0.f, 0.f);
 

@@ -82,27 +82,59 @@
 #endif
 
 #ifndef LIGHT_PHONG_SHININESS
-#define LIGHT_PHONG_SHININESS 8.0f
+#define LIGHT_PHONG_SHININESS 16.0f
 #endif
 
 // --------------------- Intensity ---------------------
+// 0 = constant intensity (uses LIGHT_INTENSITY_CONST)
+// 1 = learnable intensity (uses sigmoid(intensity_raw[0]) mapped to [MIN, MAX])
+#ifndef LIGHT_INTENSITY_MODE
+#define LIGHT_INTENSITY_MODE 1
+#endif
+
+// If LIGHT_INTENSITY_MODE==0, this constant intensity is used.
+#ifndef LIGHT_INTENSITY_CONST
+#define LIGHT_INTENSITY_CONST 1.0f
+#endif
+
+// for mapping to Min, Max
+#ifndef LIGHT_INTENSITY_MIN
+#define LIGHT_INTENSITY_MIN 0.05f
+#endif
+
+#ifndef LIGHT_INTENSITY_MAX
+#define LIGHT_INTENSITY_MAX 5.00f
+#endif
+
 
 // Spotlight params
 #ifndef FALLOFF_MODE
-#define FALLOFF_MODE 1  // 0 = none, 1 = quadratic
+#define FALLOFF_MODE 0  // 0 = none, 1 = quadratic
+#endif
+
+#ifndef FALLOFF_Z_GRAD_ENABLE
+#define FALLOFF_Z_GRAD_ENABLE 1
 #endif
 
 #ifndef FALLOFF_K
-#define FALLOFF_K 0.1f // or 1.0?
+#define FALLOFF_K 0.1f
 #endif
 
 #ifndef FALLOFF_Z_GRAD_SCALE
-#define FALLOFF_Z_GRAD_SCALE 0.00f   // prevent depth hacks
+#define FALLOFF_Z_GRAD_SCALE 1.0f   // prevent depth hacks
 #endif
 
 #ifndef FALLOFF_Z_GRAD_CLAMP
 #define FALLOFF_Z_GRAD_CLAMP 0.01f   // clamp added contribution to dL_dz
 #endif
+
+// --------------------- Li / Spec safety clamps ---------------------
+// Hard clamp of Li = I * inv to prevent white splat spikes.
+// 0 to disable the clamp.
+#ifndef LIGHT_LI_CLAMP
+#define LIGHT_LI_CLAMP 3
+#endif
+
 
 // ------------------ Specular gating ------------------
 // 0 = none
@@ -128,16 +160,16 @@
 
 // Spotlight params
 #ifndef LIGHT_SPOT_INNER_DEG
-#define LIGHT_SPOT_INNER_DEG 15.0f
+#define LIGHT_SPOT_INNER_DEG 20.0f
 #endif
 
 #ifndef LIGHT_SPOT_OUTER_DEG
-#define LIGHT_SPOT_OUTER_DEG 35.0f
+#define LIGHT_SPOT_OUTER_DEG 50.0f
 #endif
 
 // smooth ramp
 #ifndef LIGHT_SPOT_EXP
-#define LIGHT_SPOT_EXP 1.5f
+#define LIGHT_SPOT_EXP 1.0f
 #endif
 
 // Light constants
