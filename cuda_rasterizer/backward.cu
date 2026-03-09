@@ -328,13 +328,32 @@ renderCUDA(
 
 			bool reliable_hit = (rho3d <= rho2d);
 
+			// clamp local hit coordinates
+			const float uv_clamp = 3.0f;
+			float sx = fmaxf(-uv_clamp, fminf(s.x, uv_clamp));
+			float sy = fmaxf(-uv_clamp, fminf(s.y, uv_clamp));
+
 			float3 hit_cam = make_float3(
-				center_cam.x + s.x * bu_cam.x + s.y * bv_cam.x,
-				center_cam.y + s.x * bu_cam.y + s.y * bv_cam.y,
-				center_cam.z + s.x * bu_cam.z + s.y * bv_cam.z
+				center_cam.x + sx * bu_cam.x + sy * bv_cam.x,
+				center_cam.y + sx * bu_cam.y + sy * bv_cam.y,
+				center_cam.z + sx * bu_cam.z + sy * bv_cam.z
 			);
 
-			float3 point_cam = reliable_hit ? hit_cam : center_cam;
+			// sanity check on hit displacement
+			float3 delta_hit = make_float3(
+				hit_cam.x - center_cam.x,
+				hit_cam.y - center_cam.y,
+				hit_cam.z - center_cam.z
+			);
+
+			float delta2 = delta_hit.x * delta_hit.x +
+						delta_hit.y * delta_hit.y +
+						delta_hit.z * delta_hit.z;
+
+			const float hit_delta2_max = 0.25f;
+			bool sane_hit = (delta2 <= hit_delta2_max);
+
+			float3 point_cam = (reliable_hit && sane_hit) ? hit_cam : center_cam;
 
 			// compute depth
 			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]

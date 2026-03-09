@@ -399,6 +399,7 @@ LightingOut eval_lighting(
 
     float dshin_draw = 0.0f;
     float shin = shininess_value(shiny, &dshin_draw);
+    shin = fminf(shin, 64.0f);
 
     o.kspec = ks;
     o.dkspecular = dkspecular;

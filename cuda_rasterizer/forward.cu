@@ -405,7 +405,7 @@ renderCUDA(
 			float3 l = pix.y * Tw - Tv;
 			// Cross product of two planes is a line, Eq. (9)
 			float3 p = cross(k, l);
-			if (p.z == 0.0) continue;
+			if (fabsf(p.z) < 1e-8f) continue;
 			// Perspective division to get the intersection (u,v), Eq. (10)
 			float2 s = {p.x / p.z, p.y / p.z};
 			float rho3d = (s.x * s.x + s.y * s.y); 
@@ -416,6 +416,7 @@ renderCUDA(
 
 			bool reliable_hit = (rho3d <= rho2d);
 
+			// clamp local hit coordinates
 			const float uv_clamp = 3.0f;
 			float sx = fmaxf(-uv_clamp, fminf(s.x, uv_clamp));
 			float sy = fmaxf(-uv_clamp, fminf(s.y, uv_clamp));
@@ -426,7 +427,21 @@ renderCUDA(
 				center_cam.z + sx * bu_cam.z + sy * bv_cam.z
 			);
 
-			float3 point_cam = reliable_hit ? hit_cam : center_cam;
+			// sanity check on hit displacement
+			float3 delta_hit = make_float3(
+				hit_cam.x - center_cam.x,
+				hit_cam.y - center_cam.y,
+				hit_cam.z - center_cam.z
+			);
+
+			float delta2 = delta_hit.x * delta_hit.x +
+						delta_hit.y * delta_hit.y +
+						delta_hit.z * delta_hit.z;
+
+			const float hit_delta2_max = 0.25f;
+			bool sane_hit = (delta2 <= hit_delta2_max);
+
+			float3 point_cam = (reliable_hit && sane_hit) ? hit_cam : center_cam;
 
 			// compute depth
 			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
