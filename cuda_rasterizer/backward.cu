@@ -158,6 +158,7 @@ renderCUDA(
 	const float* __restrict__ kspecular,
 	const float* __restrict__ shiny,
 	const float* __restrict__ depths,
+	const float3* __restrict__ means3D_cam,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
@@ -197,6 +198,8 @@ renderCUDA(
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
 	// __shared__ float collected_depths[BLOCK_SIZE];
+
+	__shared__ float3 collected_center_cam[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -282,6 +285,7 @@ renderCUDA(
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
+			collected_center_cam[block.thread_rank()] = means3D_cam[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 				// collected_depths[block.thread_rank()] = depths[coll_id];
@@ -303,6 +307,7 @@ renderCUDA(
 			const float3 Tu = collected_Tu[j];
 			const float3 Tv = collected_Tv[j];
 			const float3 Tw = collected_Tw[j];
+			const float3 center_cam = collected_center_cam[j];
 			float3 k = pix.x * Tw - Tu;
 			float3 l = pix.y * Tw - Tv;
 			float3 p = cross(k, l);
@@ -355,7 +360,7 @@ renderCUDA(
 				const float* shi_ptr = shiny + global_id;
 
 				// Pass pointers of learned factors, pixel pos, normal, cam params
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr, &center_cam);
 
 				const float w = alpha * T;
 
@@ -523,19 +528,17 @@ renderCUDA(
 				// Unit normal used in forward
 				float3 n_unit = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
 
-				// Same view ray as eval_lighting()
-				float3 view_ray = normalize_or_default(
-					make_float3((pixf.x - 0.5f * W) / focal_x,
-								(pixf.y - 0.5f * H) / focal_y,
-								1.0f),
-					make_float3(0.f, 0.f, 1.f)
-				);
+				// Same geometry conventions as eval_lighting(..., &center_cam)
+				float3 view_ray = normalize_or_default(center_cam, make_float3(0.f, 0.f, 1.f));
 
-				// L = surface -> light (same as forward)
-				float3 Lvec = compute_light_dir(pixf, W, H, focal_x, focal_y, c_d);
+				const float comp = 0.01f * 0.70710678f;
+				const float3 light_pos = make_float3(-comp, -comp, 0.0f);
+
+				float3 Lvec = make_float3(light_pos.x - center_cam.x,
+										  light_pos.y - center_cam.y,
+										  light_pos.z - center_cam.z);
 				Lvec = normalize_or_default(Lvec, make_float3(0.f, 0.f, -1.f));
 
-				// V = surface -> camera (same as forward)
 				float3 Vvec = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
 				Vvec = normalize_or_default(Vvec, make_float3(0.f, 0.f, -1.f));
 
@@ -1033,6 +1036,7 @@ void BACKWARD::render(
 	const float* shiny,
 	const float* transMats,
 	const float* depths,
+	const float3* means3D_cam,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
@@ -1062,6 +1066,7 @@ void BACKWARD::render(
 		kspecular,
 		shiny,
 		depths,
+		means3D_cam,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,

@@ -166,6 +166,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	int* radii,
 	float2* points_xy_image,
 	float* depths,
+	float3* means3D_cam,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
@@ -245,6 +246,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	depths[idx] = p_view.z;
+	means3D_cam[idx] = p_view;
 	radii[idx] = (int)radius;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
@@ -271,6 +273,7 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
+	const float3* __restrict__ means3D_cam,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -303,6 +306,8 @@ renderCUDA(
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
+
+	__shared__ float3 collected_center_cam[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -343,6 +348,8 @@ renderCUDA(
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
+			
+			collected_center_cam[block.thread_rank()] = means3D_cam[coll_id];
 		}
 		block.sync();
 
@@ -357,6 +364,10 @@ renderCUDA(
 			const float3 Tu = collected_Tu[j];
 			const float3 Tv = collected_Tv[j];
 			const float3 Tw = collected_Tw[j];
+
+			// NEW: Gaussian center in camera space for stable falloff
+			const float3 center_cam = collected_center_cam[j];
+
 			// Transform the two planes into local u-v system. 
 			float3 k = pix.x * Tw - Tu;
 			float3 l = pix.y * Tw - Tv;
@@ -398,6 +409,7 @@ renderCUDA(
 				done = true;
 				continue;
 			}
+
 			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
 			float w      = alpha * T;
 			float w_diff = w;        // default, no lighting
@@ -408,7 +420,8 @@ renderCUDA(
 				const int gid = collected_id[j];
 				const float* ks_ptr = kspecular + gid;   // per-gaussian
 				const float* shi_ptr = shiny + gid;
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr);
+
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &center_cam);
 
 				w_diff = w * Lout.diffuse_mul;
 
@@ -496,6 +509,7 @@ void FORWARD::render(
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
+	const float3* means3D_cam,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -516,6 +530,7 @@ void FORWARD::render(
 		transMats,
 		depths,
 		normal_opacity,
+		means3D_cam,
 		final_T,
 		n_contrib,
 		bg_color,
@@ -542,6 +557,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	int* radii,
 	float2* means2D,
 	float* depths,
+	float3* means3D_cam,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
@@ -569,6 +585,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		radii,
 		means2D,
 		depths,
+		means3D_cam,
 		transMats,
 		rgb,
 		normal_opacity,

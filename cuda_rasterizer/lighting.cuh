@@ -233,7 +233,8 @@ LightingOut eval_lighting(
     const float* __restrict__ ambients,
     const float* __restrict__ intensity,
     const float* __restrict__ kspecs,
-    const float* __restrict__ shiny
+    const float* __restrict__ shiny,
+    const float3* center_cam_opt = nullptr
 ) {
     LightingOut o = {};
     // defaults (no lighting)
@@ -257,31 +258,59 @@ LightingOut eval_lighting(
     o.shiny       = LIGHT_PHONG_SHININESS;
     o.dshin_raw   = 0.0f;
 
-
-    // light direction
 #if (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
-    float3 n = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
+    float3 n = normalize_or_default(n_raw, make_float3(0.f, 0.f, 1.f));
 
-    // camera->surface direction (for view + spotlight cone)
-    float3 view_ray = normalize_or_default(
-        make_float3((pixf.x - 0.5f * W) / focal_x,
-                    (pixf.y - 0.5f * H) / focal_y,
-                    1.0f),
-        make_float3(0.f,0.f,1.f));
+    // ------------------------------------------------------------
+    // Surface point / view direction source
+    // Default = old depth-based hitpoint reconstruction
+    // Option C = use Gaussian center in camera space
+    // ------------------------------------------------------------
+    const bool use_center_cam = (center_cam_opt != nullptr);
 
-    // surface->light direction
-    float3 L = compute_light_dir(pixf, W, H, focal_x, focal_y, depth_cam);
-    L = normalize_or_default(L, make_float3(0.f,0.f,-1.f));
+    float3 P;        // point in camera space
+    float3 view_ray; // camera -> surface direction, normalized
 
-    // surface->camera (view) direction
+    if (use_center_cam)
+    {
+        P = *center_cam_opt;
+        view_ray = normalize_or_default(P, make_float3(0.f, 0.f, 1.f));
+    }
+    else
+    {
+        view_ray = normalize_or_default(
+            make_float3((pixf.x - 0.5f * W) / focal_x,
+                        (pixf.y - 0.5f * H) / focal_y,
+                        1.0f),
+            make_float3(0.f, 0.f, 1.f));
+
+        float3 r = compute_ray_unnorm(pixf, W, H, focal_x, focal_y);
+        P = make_float3(depth_cam * r.x,
+                        depth_cam * r.y,
+                        depth_cam);
+    }
+
+        // ------------------------------------------------------------
+    // Light position in camera space
+    // ------------------------------------------------------------
+    const float comp = 0.01f * 0.70710678f;
+    const float3 light_pos = make_float3(-comp, -comp, 0.0f);
+
+    // surface -> light
+    float3 L = make_float3(light_pos.x - P.x,
+                           light_pos.y - P.y,
+                           light_pos.z - P.z);
+    L = normalize_or_default(L, make_float3(0.f, 0.f, -1.f));
+
+    // surface -> camera
     float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
-    V = normalize_or_default(V, make_float3(0.f,0.f,-1.f));
+    V = normalize_or_default(V, make_float3(0.f, 0.f, -1.f));
 
-    // spotlight cone should depend on camera->surface direction, not surface->light
+    // spotlight cone depends on camera -> surface direction
     float spot = spotlight_factor(view_ray);
     o.spot = spot;
 
-    float ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
+    float ndotl = n.x * L.x + n.y * L.y + n.z * L.z;
     o.ndotl = ndotl;
 
     // lambert
@@ -305,65 +334,55 @@ LightingOut eval_lighting(
     float I = intensity_value(intensity, &dI_draw);
     o.dI_raw = dI_draw; // dI/d(raw) if learnable, else 0
 
-    // ---------------- distance / falloff with offset light ----------------
+    // ------------------------------------------------------------
+    // Distance / falloff
+    // ------------------------------------------------------------
+    float inv = 1.0f;
+    o.dintensity_ddepth = 0.0f;
 
-    // Ray through pixel in camera coords (z=1, unnormalized)
-    float3 r = compute_ray_unnorm(pixf, W, H, focal_x, focal_y);
-
-    // Camera-space hit point at z = depth_cam
-    float3 P = make_float3(depth_cam * r.x,
-                        depth_cam * r.y,
-                        depth_cam);
-
-    // Light position in camera space (1cm left + up, diagonal)
-    const float comp = 0.01f * 0.70710678f;
-    const float3 light_pos = make_float3(-comp, -comp, 0.0f);
-
-    // Vector from light to point (L -> P)
     float3 LP = make_float3(P.x - light_pos.x,
                             P.y - light_pos.y,
                             P.z - light_pos.z);
 
-    // -------- distance falloff (for Li) --------
-    float inv = 1.0f;
+    float dist2 = fmaxf(LP.x * LP.x + LP.y * LP.y + LP.z * LP.z, 1e-12f);
+
+#if (FALLOFF_MODE == 0)
+    inv = 1.0f;
     o.dintensity_ddepth = 0.0f;
 
-    // dist^2 and dist
-    float dist2 = fmaxf(LP.x*LP.x + LP.y*LP.y + LP.z*LP.z, 1e-12f);
+#elif (FALLOFF_MODE == 1)
+    const float k = FALLOFF_K;
+    inv = 1.0f / (1.0f + k * dist2);
 
-    #if (FALLOFF_MODE == 0)
-        // no falloff
-        inv = 1.0f;
-        o.dintensity_ddepth = 0.0f;
-
-    #elif (FALLOFF_MODE == 1)
-        // quadratic-ish: inv = 1/(1 + k*dist^2)
-        const float k = FALLOFF_K;
-        inv = 1.0f / (1.0f + k * dist2);
-
-        // Derivative for backward: d(Li)/d(depth)
-        float d_dist2_ddepth = 2.0f * (LP.x*r.x + LP.y*r.y + LP.z*1.0f);
+    if (!use_center_cam)
+    {
+        // old depth-based derivative path
+        float3 r = compute_ray_unnorm(pixf, W, H, focal_x, focal_y);
+        float d_dist2_ddepth = 2.0f * (LP.x * r.x + LP.y * r.y + LP.z * 1.0f);
         float d_inv_d_dist2  = -k * inv * inv;
         o.dintensity_ddepth  = I * d_inv_d_dist2 * d_dist2_ddepth;
-
-    #else
-        // fallback: treat as no falloff
-        inv = 1.0f;
+    }
+    else
+    {
+        // Option C: no depth-based falloff gradient
         o.dintensity_ddepth = 0.0f;
-    #endif
+    }
+#else
+    inv = 1.0f;
+    o.dintensity_ddepth = 0.0f;
+#endif
 
     o.inv = inv;
 
-    // Li_raw = I * inv
     float Li_raw = I * inv;
     float Li = Li_raw;
 
-    #if (LIGHT_LI_CLAMP > 0)
-        if (Li > (float)LIGHT_LI_CLAMP) {
-            Li = (float)LIGHT_LI_CLAMP;
-            o.li_clamped = 1.0f;
-        }
-    #endif
+#if (LIGHT_LI_CLAMP > 0)
+    if (Li > (float)LIGHT_LI_CLAMP) {
+        Li = (float)LIGHT_LI_CLAMP;
+        o.li_clamped = 1.0f;
+    }
+#endif
 
     o.intensity = Li;
 
@@ -417,9 +436,7 @@ LightingOut eval_lighting(
   #endif
 
     o.spec_base = spec_base;
-    float spec_add = o.kspec * spec_base;
-
-    o.spec_add = spec_add;
+    o.spec_add = o.kspec * spec_base;
 
 #endif
 

@@ -159,6 +159,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.clamped, P * 3, 128);
 	obtain(chunk, geom.internal_radii, P, 128);
 	obtain(chunk, geom.means2D, P, 128);
+	obtain(chunk, geom.means3D_cam, P, 128);   // NEW
 	obtain(chunk, geom.transMat, P * 9, 128);
 	obtain(chunk, geom.normal_opacity, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
@@ -269,6 +270,7 @@ int CudaRasterizer::Rasterizer::forward(
 		radii,
 		geomState.means2D,
 		geomState.depths,
+		geomState.means3D_cam,
 		geomState.transMat,
 		geomState.rgb,
 		geomState.normal_opacity,
@@ -340,6 +342,7 @@ int CudaRasterizer::Rasterizer::forward(
 		transMat_ptr,
 		geomState.depths,
 		geomState.normal_opacity,
+		geomState.means3D_cam,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
@@ -429,6 +432,7 @@ void CudaRasterizer::Rasterizer::backward(
 		shiny,
 		transMat_ptr,
 		depth_ptr,
+		geomState.means3D_cam,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,

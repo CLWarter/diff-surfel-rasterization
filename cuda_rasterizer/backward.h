@@ -36,6 +36,7 @@ namespace BACKWARD
 		const float* kspecular,
 		const float* shiny,
 		const float* depths,
+		const float3* means3D_cam,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
