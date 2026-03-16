@@ -329,7 +329,7 @@ renderCUDA(
 			bool reliable_hit = (rho3d <= rho2d);
 
 			// clamp local hit coordinates
-			const float uv_clamp = 3.0f;
+			const float uv_clamp = LIGHT_HIT_UV_CLAMP;
 			float sx = fmaxf(-uv_clamp, fminf(s.x, uv_clamp));
 			float sy = fmaxf(-uv_clamp, fminf(s.y, uv_clamp));
 
@@ -352,7 +352,7 @@ renderCUDA(
 						delta_hit.y * delta_hit.y +
 						delta_hit.z * delta_hit.z;
 
-			const float hit_delta2_max = 0.25f;
+			const float hit_delta2_max = LIGHT_HIT_DELTA2_MAX;
 			bool sane_hit = (delta2 <= hit_delta2_max);
 
 			float3 point_cam = (reliable_hit && sane_hit) ? hit_cam : center_cam;
@@ -364,6 +364,11 @@ renderCUDA(
 
 			if (hit_was_clamped)
 				surface_conf *= LIGHT_CONF_CLAMPED_HIT;
+
+			float point_disp = sqrtf(fmaxf(delta2, 1e-12f));
+			float disp_conf = 1.0f / (1.0f + LIGHT_CONF_DISP_K * point_disp);
+			surface_conf *= disp_conf;
+			surface_conf = fmaxf(0.05f, fminf(surface_conf, 1.0f));
 
 			// compute depth
 			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]
@@ -382,9 +387,14 @@ renderCUDA(
 				continue;
 
 			const float G = exp(power);
-			const float alpha = min(0.99f, opa * G);
-			if (alpha < 1.0f / 255.0f)
+			float alpha = min(0.99f, opa * exp(power));
+			if (alpha < LIGHT_ALPHA_SKIP_THRESHOLD)
 				continue;
+
+			if (alpha < LIGHT_ALPHA_SOFT_REF)
+				surface_conf *= LIGHT_CONF_LOW_ALPHA;
+
+			surface_conf = fmaxf(0.05f, fminf(surface_conf, 1.0f));
 
 			T = T / (1.f - alpha);
 
@@ -407,7 +417,7 @@ renderCUDA(
 				const float* shi_ptr = shiny + global_id;
 
 				// Pass pointers of learned factors, pixel pos, normal, cam params
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr, &point_cam, surface_conf);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr, &point_cam, surface_conf, alpha);
 
 				const float w = alpha * T;
 

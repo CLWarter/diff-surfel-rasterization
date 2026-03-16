@@ -22,7 +22,7 @@ struct LightingOut {
     float dintensity_ddepth;    // d(Li)/d(depth_cam)
     float li_clamped;           // 1 if Li was clamped, else 0
 
-    float dI_raw;      // dI / dI_raw (sigmoid mapping)
+    float dI_raw;      // dI / dI_raw (intensity activation derivative)
 
     float kspec;       // specular factor
     float dkspecular;  // derivative of spec factor
@@ -124,6 +124,29 @@ __device__ __forceinline__ float sigmoidf_stable(float x)
     }
 }
 
+__device__ __forceinline__ float softplusf_stable(float x)
+{
+    // numerically stable softplus
+    if (x > 20.0f) return x;          // log(1 + exp(x)) ~ x
+    if (x < -20.0f) return expf(x);   // log(1 + exp(x)) ~ exp(x)
+    return log1pf(expf(x));
+}
+
+__device__ __forceinline__ float softplus_beta2(float x)
+{
+    const float beta = 2.0f;
+
+    float bx = beta * x;
+
+    // numerically stable
+    if (bx > 20.0f)
+        return x;                   // ≈ x
+    if (bx < -20.0f)
+        return expf(bx) / beta;     // ≈ exp(2x)/2
+
+    return log1pf(expf(bx)) / beta;
+}
+
 __device__ __forceinline__ float3 normalize_or_default(float3 v, float3 def) {
     float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
     if (len2 <= 1e-20f) return def;
@@ -134,8 +157,14 @@ __device__ __forceinline__ float3 normalize_or_default(float3 v, float3 def) {
 
 __device__ __forceinline__ float clamp01(float x) { return fminf(fmaxf(x, 0.0f), 1.0f); }
 
+__device__ __forceinline__
+float saturate01(float x)
+{
+    return fmaxf(0.0f, fminf(x, 1.0f));
+}
+
 __device__ __forceinline__ float smoothstep01(float t) {
-    t = clamp01(t);
+    t = saturate01(t);
     return t*t*(3.0f - 2.0f*t);
 }
 
@@ -202,11 +231,19 @@ __device__ __forceinline__ float intensity_value(
     float* dI_draw_out // returns dI/d(intensity_raw[0]) when learnable, else 0
 ) {
 #if (LIGHT_INTENSITY_MODE == 1)
-    // learnable: map sigmoid(raw) into [MIN, MAX]
-    float t = sigmoidf_stable(intensity_raw[0]); // in (0,1)
+    // learnable: I = softplus(raw)
+    float raw = intensity_raw[0];
+
+    // -------- numeric safety clamp --------
+    raw = fminf(fmaxf(raw, -15.0f), 15.0f);
+
+    float I = softplus_beta2(raw);
+
+    // derivative of softplus = sigmoid(raw)
     if (dI_draw_out)
-        *dI_draw_out = (LIGHT_INTENSITY_MAX - LIGHT_INTENSITY_MIN) * t * (1.0f - t);
-    return LIGHT_INTENSITY_MIN + (LIGHT_INTENSITY_MAX - LIGHT_INTENSITY_MIN) * t;
+        *dI_draw_out = sigmoidf_stable(raw);
+
+    return I;
 #else
     // constant
     if (dI_draw_out) *dI_draw_out = 0.0f;
@@ -235,7 +272,8 @@ LightingOut eval_lighting(
     const float* __restrict__ kspecs,
     const float* __restrict__ shiny,
     const float3* point_cam_opt = nullptr,
-    float surface_conf = 1.0f
+    float surface_conf = 1.0f,
+    float alpha_local = 1.0f
 ) {
     LightingOut o = {};
     // defaults (no lighting)
@@ -310,15 +348,18 @@ LightingOut eval_lighting(
     // Stabilization
     float nv_raw = fmaxf(-(n.x * view_ray.x + n.y * view_ray.y + n.z * view_ray.z), 0.0f);
 
-    // more stabilization when grazing
     float t = (nv_raw - LIGHT_NORMAL_GRAZING_END) /
               (LIGHT_NORMAL_GRAZING_START - LIGHT_NORMAL_GRAZING_END);
     t = fmaxf(0.0f, fminf(t, 1.0f));
     float grazing_t = 1.0f - smoothstep01(t);
 
-    // blend slightly toward camera-facing direction
+    // extra stabilization for weak contributors
+    float alpha_weak = 1.0f - saturate01(alpha_local / LIGHT_ALPHA_SOFT_REF);
+    float alpha_boost = alpha_weak * LIGHT_NORMAL_ALPHA_BOOST;
+
     float3 n_view = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
-    float blend_w = LIGHT_NORMAL_VIEW_BLEND * grazing_t;
+    float blend_w = LIGHT_NORMAL_VIEW_BLEND * grazing_t + alpha_boost;
+    blend_w = saturate01(blend_w);
 
     float3 n_stable = make_float3(
         (1.0f - blend_w) * n.x + blend_w * n_view.x,
@@ -394,11 +435,14 @@ LightingOut eval_lighting(
     o.dintensity_ddepth = 0.0f;
 #endif
 
-    o.inv = inv;
+     o.inv = inv;
 
     float Li_raw = I * inv;
-    float Li = Li_raw * surface_conf;
 
+    float alpha_conf = saturate01(alpha_local / LIGHT_ALPHA_SOFT_REF);
+    float shade_conf = surface_conf * ((1.0f - LIGHT_WEAK_SHADE_REDUCTION) + LIGHT_WEAK_SHADE_REDUCTION * alpha_conf);
+
+    float Li = Li_raw * shade_conf;
 #if (LIGHT_LI_CLAMP > 0)
     if (Li > (float)LIGHT_LI_CLAMP) {
         Li = (float)LIGHT_LI_CLAMP;

@@ -277,6 +277,14 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
+__device__ __forceinline__
+void set_debug_gray(float C[3], float v)
+{
+    v = saturate01(v);
+    C[0] = v;
+    C[1] = v;
+    C[2] = v;
+}
 
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
@@ -417,7 +425,7 @@ renderCUDA(
 			bool reliable_hit = (rho3d <= rho2d);
 
 			// clamp local hit coordinates
-			const float uv_clamp = 3.0f;
+			const float uv_clamp = LIGHT_HIT_UV_CLAMP;
 			float sx = fmaxf(-uv_clamp, fminf(s.x, uv_clamp));
 			float sy = fmaxf(-uv_clamp, fminf(s.y, uv_clamp));
 
@@ -440,7 +448,7 @@ renderCUDA(
 						delta_hit.y * delta_hit.y +
 						delta_hit.z * delta_hit.z;
 
-			const float hit_delta2_max = 0.25f;
+			const float hit_delta2_max = LIGHT_HIT_DELTA2_MAX;
 			bool sane_hit = (delta2 <= hit_delta2_max);
 
 			float3 point_cam = (reliable_hit && sane_hit) ? hit_cam : center_cam;
@@ -452,6 +460,24 @@ renderCUDA(
 
 			if (hit_was_clamped)
 				surface_conf *= LIGHT_CONF_CLAMPED_HIT;
+				
+			float point_disp = sqrtf(fmaxf(delta2, 1e-12f));
+			float disp_conf = 1.0f / (1.0f + LIGHT_CONF_DISP_K * point_disp);
+			surface_conf *= disp_conf;
+			surface_conf = fmaxf(0.05f, fminf(surface_conf, 1.0f));
+
+			float3 LP_dbg = make_float3(
+				point_cam.x - (-0.01f * 0.70710678f),
+				point_cam.y - (-0.01f * 0.70710678f),
+				point_cam.z - 0.0f
+			);
+
+			float dist2_dbg = LP_dbg.x * LP_dbg.x + LP_dbg.y * LP_dbg.y + LP_dbg.z * LP_dbg.z;
+			float dist_dbg = sqrtf(fmaxf(dist2_dbg, 1e-12f));
+
+			float disp_x = point_cam.x - center_cam.x;
+			float disp_y = point_cam.y - center_cam.y;
+			float disp_z = point_cam.z - center_cam.z;
 
 			// compute depth
 			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
@@ -472,9 +498,17 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, opa * exp(power));
-			if (alpha < 1.0f / 255.0f)
+			if (alpha < LIGHT_ALPHA_SKIP_THRESHOLD)
 				continue;
+
+			// weak contributors should shape shading less
+			if (alpha < LIGHT_ALPHA_SOFT_REF)
+				surface_conf *= LIGHT_CONF_LOW_ALPHA;
+
+			surface_conf = fmaxf(0.05f, fminf(surface_conf, 1.0f));
+
 			float test_T = T * (1 - alpha);
+
 			if (test_T < 0.0001f)
 			{
 				done = true;
@@ -492,7 +526,7 @@ renderCUDA(
 				const float* ks_ptr = kspecular + gid;   // per-gaussian
 				const float* shi_ptr = shiny + gid;
 
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam, surface_conf);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam, surface_conf, alpha);
 
 				w_diff = w * Lout.diffuse_mul;
 
@@ -518,6 +552,108 @@ renderCUDA(
 			}
 			// Render normal map
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
+#endif
+
+#if (LIGHT_DEBUG_MODE > 0)
+			{
+				float dbg = 0.0f;
+
+				#if (LIGHT_DEBUG_MODE == 1)
+					// distance from chosen lighting point to light
+					dbg = 1.0f / (1.0f + dist_dbg);
+
+				#elif (LIGHT_DEBUG_MODE == 2)
+					// falloff inv only
+					dbg = Lout.inv / (1.0f + Lout.inv);
+
+				#elif (LIGHT_DEBUG_MODE == 3)
+					// final lighting intensity after I * inv * confidence and clamp
+					dbg = Lout.intensity / (1.0f + Lout.intensity);
+
+				#elif (LIGHT_DEBUG_MODE == 4)
+					// spotlight factor
+					dbg = Lout.spot * LIGHT_DEBUG_SCALE;
+
+				#elif (LIGHT_DEBUG_MODE == 5)
+					// hit-state mask:
+					// red = fallback
+					// green = reliable+sane
+					// blue = clamped
+					C[0] = (!reliable_hit || !sane_hit) ? 1.0f : 0.0f;
+					C[1] = (reliable_hit && sane_hit) ? 1.0f : 0.0f;
+					C[2] = 0.0f;
+
+				#elif (LIGHT_DEBUG_MODE == 6)
+					// displacement of point_cam from center_cam
+					dbg = point_disp / (0.1f + point_disp);
+
+				#elif (LIGHT_DEBUG_MODE == 7)
+					// raw normal visualization
+					C[0] = 0.5f * (normal[0] + 1.0f);
+					C[1] = 0.5f * (normal[1] + 1.0f);
+					C[2] = 0.5f * (normal[2] + 1.0f);
+
+				#elif (LIGHT_DEBUG_MODE == 8)
+					// learned ambient
+					dbg = ambients[gid] * LIGHT_DEBUG_SCALE;
+
+				#elif (LIGHT_DEBUG_MODE == 9)
+					// learned intensity value as seen by eval_lighting
+					{
+						float dI_dummy = 0.0f;
+						float I_dbg = intensity_value(intensity, &dI_dummy);
+						dbg = I_dbg / (1.0f + I_dbg);
+					}
+
+				#elif (LIGHT_DEBUG_MODE == 10)
+					// learned kspec
+					dbg = kspec_value(ks_ptr) * LIGHT_DEBUG_SCALE;
+
+				#elif (LIGHT_DEBUG_MODE == 11)
+					// learned shiny
+					{
+						float dshin_dummy = 0.0f;
+						float s_dbg = shininess_value(shi_ptr, &dshin_dummy);
+						dbg = logf(1.0f + s_dbg) / logf(1.0f + LIGHT_SHINY_MAX);
+					}
+
+				#elif (LIGHT_DEBUG_MODE == 12)
+					// ndotl
+					dbg = 0.5f * (Lout.ndotl + 1.0f);
+
+				#elif (LIGHT_DEBUG_MODE == 13)
+					// lambert term
+					dbg = Lout.lambert * LIGHT_DEBUG_SCALE;
+
+				#elif (LIGHT_DEBUG_MODE == 14)
+					// specular additive contribution
+					dbg = Lout.spec_add / (1.0f + Lout.spec_add);
+
+				#elif (LIGHT_DEBUG_MODE == 15)
+					// chosen point depth
+					dbg = point_cam.z / (1.0f + point_cam.z);
+
+				#elif (LIGHT_DEBUG_MODE == 16)
+					// local alpha contribution
+					dbg = alpha * 32.0f;
+
+				#elif (LIGHT_DEBUG_MODE == 17)
+					// local compositing weight w = alpha * T
+					dbg = w * 32.0f;
+				#endif
+
+				#if (LIGHT_DEBUG_MODE != 5) && (LIGHT_DEBUG_MODE != 7)
+					dbg = saturate01(dbg);
+					C[0] = dbg;
+					C[1] = dbg;
+					C[2] = dbg;
+				#endif
+
+				// in debug mode, still advance compositing state so the viewer updates correctly
+				T = test_T;
+				last_contributor = contributor;
+				continue;
+			}
 #endif
 
 			// Diffuse

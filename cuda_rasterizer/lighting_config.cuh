@@ -97,19 +97,9 @@
 #define LIGHT_INTENSITY_CONST 1.0f
 #endif
 
-// for mapping to Min, Max
-#ifndef LIGHT_INTENSITY_MIN
-#define LIGHT_INTENSITY_MIN 0.05f
-#endif
-
-#ifndef LIGHT_INTENSITY_MAX
-#define LIGHT_INTENSITY_MAX 5.00f
-#endif
-
-
 // Spotlight params
 #ifndef FALLOFF_MODE
-#define FALLOFF_MODE 1  // 0 = none, 1 = quadratic
+#define FALLOFF_MODE 0  // 0 = none, 1 = quadratic
 #endif
 
 #ifndef FALLOFF_Z_GRAD_ENABLE
@@ -132,7 +122,7 @@
 // Hard clamp of Li = I * inv to prevent white splat spikes.
 // 0 to disable the clamp.
 #ifndef LIGHT_LI_CLAMP
-#define LIGHT_LI_CLAMP 3
+#define LIGHT_LI_CLAMP 0
 #endif
 
 
@@ -155,7 +145,7 @@
 // 0 = off
 // 1 = on
 #ifndef LIGHT_USE_SPOT
-#define LIGHT_USE_SPOT 1
+#define LIGHT_USE_SPOT 0
 #endif
 
 // Spotlight params
@@ -178,6 +168,33 @@
 #endif
 
 
+#ifndef LIGHT_DEBUG_MODE
+#define LIGHT_DEBUG_MODE 0
+#endif
+
+// 0 = off
+// 1 = point_cam distance to light
+// 2 = falloff inv
+// 3 = final Li after intensity * falloff * conf
+// 4 = spotlight factor
+// 5 = reliable/sane/clamped hit mask
+// 6 = point_cam vs center_cam displacement
+// 7 = learned raw normal
+// 8 = learned ambient
+// 9 = learned intensity parameter/value
+// 10 = learned kspec
+// 11 = learned shiny
+// 12 = ndotl
+// 13 = lambert
+// 14 = spec_add
+// 15 = point_cam.z
+// 16 = alpha contribution
+// 17 = w contribution
+// 18 = accumulated final alpha
+
+#ifndef LIGHT_DEBUG_SCALE
+#define LIGHT_DEBUG_SCALE 1.0f
+#endif
 
 #ifndef LIGHT_CONF_FALLBACK
 #define LIGHT_CONF_FALLBACK 0.65f
@@ -197,4 +214,44 @@
 
 #ifndef LIGHT_NORMAL_GRAZING_END
 #define LIGHT_NORMAL_GRAZING_END 0.05f
+#endif
+
+#ifndef LIGHT_CONF_LOW_ALPHA
+#define LIGHT_CONF_LOW_ALPHA 0.65f
+#endif
+
+#ifndef LIGHT_CONF_GRAZING
+#define LIGHT_CONF_GRAZING 0.75f
+#endif
+
+#ifndef LIGHT_CONF_DISP_K
+#define LIGHT_CONF_DISP_K 8.0f
+#endif
+
+#ifndef LIGHT_HIT_UV_CLAMP
+#define LIGHT_HIT_UV_CLAMP 1.5f
+#endif
+
+#ifndef LIGHT_HIT_DELTA2_MAX
+#define LIGHT_HIT_DELTA2_MAX 0.05f
+#endif
+
+#ifndef LIGHT_ALPHA_SOFT_REF
+#define LIGHT_ALPHA_SOFT_REF (2.0f / 255.0f)
+#endif
+
+#ifndef LIGHT_ALPHA_SKIP_THRESHOLD
+#define LIGHT_ALPHA_SKIP_THRESHOLD (1.0f / 255.0f)
+#endif
+
+#ifndef LIGHT_NORMAL_CONF_BOOST
+#define LIGHT_NORMAL_CONF_BOOST 0.35f
+#endif
+
+#ifndef LIGHT_NORMAL_ALPHA_BOOST
+#define LIGHT_NORMAL_ALPHA_BOOST 0.30f
+#endif
+
+#ifndef LIGHT_WEAK_SHADE_REDUCTION
+#define LIGHT_WEAK_SHADE_REDUCTION 0.75f
 #endif
