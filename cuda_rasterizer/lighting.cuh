@@ -30,6 +30,7 @@ struct LightingOut {
     float shiny;       // shininess exponent
     float dshin_raw;   // d(shiny)/d(shiny_raw)
 
+    float shade_conf;
 };
 
 __device__ __forceinline__ float3 apply_norm_jacobian(float3 n_raw, float3 g_unit)
@@ -241,7 +242,7 @@ __device__ __forceinline__ float intensity_value(
 
     // derivative of softplus = sigmoid(raw)
     if (dI_draw_out)
-        *dI_draw_out = sigmoidf_stable(raw);
+        *dI_draw_out = sigmoidf_stable(2.0f * raw);
 
     return I;
 #else
@@ -258,6 +259,225 @@ float3 compute_ray_unnorm(const float2& pixf, int W, int H, float focal_x, float
     float x = (pixf.x - 0.5f * (float)W) / focal_x;
     float y = (pixf.y - 0.5f * (float)H) / focal_y;
     return make_float3(x, y, 1.0f); // unnormalized
+}
+
+__device__ __forceinline__
+float3 pointcam_lighting_grad_approx(
+    const LightingOut& Lout,
+    const float3& point_cam,
+    const float3& n_used,      // use the same normal you use in backward approximation
+    float dL_ddiffuse,
+    float dL_dspec)
+{
+    const float comp = 0.01f * 0.70710678f;
+    const float3 light_pos = make_float3(-comp, -comp, 0.0f);
+
+    float3 P = point_cam;
+
+    // view ray = normalize(P)
+    float3 view_ray = normalize_or_default(P, make_float3(0.f, 0.f, 1.f));
+    float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
+    V = normalize_or_default(V, make_float3(0.f, 0.f, -1.f));
+
+    // L = normalize(light_pos - P)
+    float3 Lraw = make_float3(light_pos.x - P.x, light_pos.y - P.y, light_pos.z - P.z);
+    float3 L = normalize_or_default(Lraw, make_float3(0.f, 0.f, -1.f));
+
+    float3 Hraw = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
+    float3 H = normalize_or_default(Hraw, make_float3(0.f, 0.f, -1.f));
+
+    float3 gP = make_float3(0.f, 0.f, 0.f);
+
+    // -------- diffuse via ndotl wrt L(P) --------
+#if LIGHT_USE_LAMBERT
+    {
+        float dL_dlambert = dL_ddiffuse * Lout.spot * Lout.intensity;
+        #if LIGHT_ENERGY_COMP
+            dL_dlambert *= (1.0f - Lout.kspec);
+        #endif
+
+        float dL_dndotl = 0.0f;
+        #if LIGHT_LAMBERT_ABS
+            if (Lout.ndotl > 0.0f) dL_dndotl = dL_dlambert;
+            else if (Lout.ndotl < 0.0f) dL_dndotl = -dL_dlambert;
+        #else
+            if (Lout.ndotl > 0.0f) dL_dndotl = dL_dlambert;
+        #endif
+
+        if (dL_dndotl != 0.0f)
+        {
+            // ndotl = dot(n_used, L)
+            // d(ndotl)/dL = n_used
+            float3 gL = make_float3(
+                dL_dndotl * n_used.x,
+                dL_dndotl * n_used.y,
+                dL_dndotl * n_used.z
+            );
+
+            // L = normalize(light_pos - P), so dL/dP = -J_norm(Lraw)
+            float3 gLraw = apply_norm_jacobian(Lraw, gL);
+            gP.x -= gLraw.x;
+            gP.y -= gLraw.y;
+            gP.z -= gLraw.z;
+        }
+    }
+#endif
+
+    // -------- spec via ndoth wrt H(P) --------
+#if LIGHT_USE_PHONG
+    {
+        if (Lout.ndoth > 0.0f && dL_dspec != 0.0f)
+        {
+            float spec_deriv = 0.0f;
+            const float nd_eps = 1e-6f;
+            if (Lout.ndoth > nd_eps)
+                spec_deriv = Lout.shiny * (Lout.spec_pow / Lout.ndoth);
+
+            float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot * Lout.intensity;
+
+            #if (LIGHT_SPEC_GATING == 1)
+                if (Lout.ndotl <= 0.0f) dspec_dndoth = 0.0f;
+            #elif (LIGHT_SPEC_GATING == 2)
+                dspec_dndoth *= Lout.lambert;
+            #endif
+
+            float dL_dndoth = dL_dspec * dspec_dndoth;
+
+            if (dL_dndoth != 0.0f)
+            {
+                // ndoth = dot(n_used, H)
+                float3 gH = make_float3(
+                    dL_dndoth * n_used.x,
+                    dL_dndoth * n_used.y,
+                    dL_dndoth * n_used.z
+                );
+
+                float3 gHraw = apply_norm_jacobian(Hraw, gH);
+
+                // Hraw = L + V
+                float3 gL = gHraw;
+                float3 gV = gHraw;
+
+                // V = normalize(-P)
+                float3 negP = make_float3(-P.x, -P.y, -P.z);
+                float3 gNegP = apply_norm_jacobian(negP, gV);
+                gP.x -= gNegP.x;
+                gP.y -= gNegP.y;
+                gP.z -= gNegP.z;
+
+                // L = normalize(light_pos - P)
+                float3 gLraw = apply_norm_jacobian(Lraw, gL);
+                gP.x -= gLraw.x;
+                gP.y -= gLraw.y;
+                gP.z -= gLraw.z;
+            }
+        }
+    }
+#endif
+
+// -------- spotlight wrt point_cam --------
+    #if LIGHT_USE_SPOT
+    {
+        float cosTheta = view_ray.z; // dot(view_ray, axis)
+
+        const float innerCos = cosf(LIGHT_SPOT_INNER_DEG * (LIGHT_PI / 180.f));
+        const float outerCos = cosf(LIGHT_SPOT_OUTER_DEG * (LIGHT_PI / 180.f));
+        float denom = fmaxf(innerCos - outerCos, 1e-6f);
+
+        float t = (cosTheta - outerCos) / denom;
+
+        if (t > 0.0f && t < 1.0f)
+        {
+            float ds_dt = 6.0f * t * (1.0f - t);
+            float ds_dcos = ds_dt / denom;
+
+            if (LIGHT_SPOT_EXP != 1.0f)
+            {
+                float s0 = smoothstep01(t);
+                ds_dcos *= LIGHT_SPOT_EXP * powf(fmaxf(s0, 1e-8f), LIGHT_SPOT_EXP - 1.0f);
+            }
+
+            float dDiffuse_dSpot = 0.0f;
+            #if LIGHT_USE_LAMBERT
+                dDiffuse_dSpot = dL_ddiffuse * Lout.lambert * Lout.intensity;
+                #if LIGHT_ENERGY_COMP
+                    dDiffuse_dSpot *= (1.0f - Lout.kspec);
+                #endif
+            #endif
+
+            float dSpec_dSpot = 0.0f;
+            #if LIGHT_USE_PHONG
+                float base = Lout.kspec * Lout.spec_pow * Lout.intensity;
+                #if (LIGHT_SPEC_GATING == 1)
+                    if (Lout.ndotl > 0.0f) dSpec_dSpot = dL_dspec * base;
+                #elif (LIGHT_SPEC_GATING == 2)
+                    dSpec_dSpot = dL_dspec * base * Lout.lambert;
+                #else
+                    dSpec_dSpot = dL_dspec * base;
+                #endif
+            #endif
+
+            float dL_dcos = (dDiffuse_dSpot + dSpec_dSpot) * ds_dcos;
+
+            float3 g_view = make_float3(0.f, 0.f, dL_dcos);
+            float3 gP_view = apply_norm_jacobian(P, g_view);
+
+            gP.x += gP_view.x;
+            gP.y += gP_view.y;
+            gP.z += gP_view.z;
+        }
+    }
+    #endif
+
+    // -------- falloff wrt point_cam --------
+#if (FALLOFF_MODE == 1)
+    {
+        float dDiff_dLi = 0.0f;
+        #if LIGHT_USE_LAMBERT
+            dDiff_dLi = Lout.lambert * Lout.spot;
+            #if LIGHT_ENERGY_COMP
+                dDiff_dLi *= (1.0f - Lout.kspec);
+            #endif
+        #endif
+
+        float dSpec_dLi = 0.0f;
+        #if LIGHT_USE_PHONG
+            float base = Lout.spec_pow * Lout.spot;
+            #if (LIGHT_SPEC_GATING == 1)
+                if (Lout.ndotl <= 0.0f) base = 0.0f;
+            #elif (LIGHT_SPEC_GATING == 2)
+                base *= Lout.lambert;
+            #endif
+            dSpec_dLi = Lout.kspec * base;
+        #endif
+
+        float dL_dLi = dL_ddiffuse * dDiff_dLi + dL_dspec * dSpec_dLi;
+
+        float3 LP = make_float3(P.x - light_pos.x, P.y - light_pos.y, P.z - light_pos.z);
+        float dist2 = fmaxf(LP.x*LP.x + LP.y*LP.y + LP.z*LP.z, 1e-4f);
+
+        const float k = FALLOFF_K;
+        float inv = 1.0f / (1.0f + k * dist2);
+        float dInv_dDist2 = -k * inv * inv;
+
+        float dLi_dDist2 = 0.0f;
+        #if (LIGHT_LI_CLAMP > 0)
+            if (Lout.li_clamped <= 0.5f)
+                dLi_dDist2 = (Lout.intensity / fmaxf(Lout.inv * Lout.shade_conf, 1e-8f)) * dInv_dDist2 * Lout.shade_conf;
+        #else
+            float I = Lout.intensity / fmaxf(Lout.inv * Lout.shade_conf, 1e-8f);
+            dLi_dDist2 = I * dInv_dDist2 * Lout.shade_conf;
+        #endif
+
+        float dL_dDist2 = dL_dLi * dLi_dDist2;
+
+        gP.x += dL_dDist2 * 2.0f * LP.x;
+        gP.y += dL_dDist2 * 2.0f * LP.y;
+        gP.z += dL_dDist2 * 2.0f * LP.z;
+    }
+#endif
+
+    return gP;
 }
 
 __device__ __forceinline__
@@ -450,6 +670,7 @@ LightingOut eval_lighting(
     }
 #endif
 
+    o.shade_conf = shade_conf;
     o.intensity = Li;
 
     // kspec / shiny
@@ -476,12 +697,18 @@ LightingOut eval_lighting(
 
     // diffuse multiplier
 #if LIGHT_USE_LAMBERT
-        float diffuse_base = a + (1.0f - a) * lambert * spot * Li;
+        float diffuse_base = lambert * spot * Li;
+        // a + (1.0f - a) * lambert *...
+        #if (LIGHT_AMBIENT_MODE != 0)
+            diffuse_base += a;
+        #endif
+
         o.diffuse_base = diffuse_base;
 
     #if LIGHT_ENERGY_COMP && LIGHT_USE_PHONG
         diffuse_base *= (1.0f - o.kspec);
     #endif
+
         o.diffuse_mul = diffuse_base;
 #endif
 

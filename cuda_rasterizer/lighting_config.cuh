@@ -99,7 +99,7 @@
 
 // Spotlight params
 #ifndef FALLOFF_MODE
-#define FALLOFF_MODE 0  // 0 = none, 1 = quadratic
+#define FALLOFF_MODE 1  // 0 = none, 1 = quadratic
 #endif
 
 #ifndef FALLOFF_Z_GRAD_ENABLE
@@ -145,7 +145,7 @@
 // 0 = off
 // 1 = on
 #ifndef LIGHT_USE_SPOT
-#define LIGHT_USE_SPOT 0
+#define LIGHT_USE_SPOT 1
 #endif
 
 // Spotlight params
