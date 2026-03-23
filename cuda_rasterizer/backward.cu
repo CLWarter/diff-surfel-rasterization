@@ -307,19 +307,24 @@ renderCUDA(
 			if (contributor >= last_contributor)
 				continue;
 
-				// ------------------------------------------------------------
-// Layer-based shading gate (front = 1, deeper = reduced)
 // ------------------------------------------------------------
-float layer_w = 0.0f;
+// Soft multi-layer shading gate
+// layer_idx = 0 -> front-most visible contributor
+// ------------------------------------------------------------
+int layer_idx = (last_contributor - 1) - contributor;
 
-// simple version: only front-most
-if (contributor == last_contributor - 1)
+float layer_w = 1.0f;
+if (layer_idx == 0)
 {
     layer_w = 1.0f;
 }
+else if (layer_idx == 1)
+{
+    layer_w = 0.7f;
+}
 else
 {
-    layer_w = LIGHT_DEEP_SHADE; // e.g. 0.1–0.3
+    layer_w = 0.35f;
 }
 
 			// compute ray-splat intersection as before
@@ -441,7 +446,7 @@ else
 
 				// Shaded color is: shaded = diffuse_mul * base_color + spec_add (RGB only)
 				// Gradient into base color multiplied by diffuse_mul
-				const float dchannel_dcolor = w * Lout.diffuse_mul;
+				const float dchannel_dcolor = w * (layer_w * Lout.diffuse_mul + (1.0f - layer_w));
 
 				// Accumulators for lighting parameter gradients
 				float dL_ddiffuse = 0.0f; // accum over channels

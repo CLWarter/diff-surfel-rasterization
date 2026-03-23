@@ -261,5 +261,5 @@
 #endif
 
 #ifndef LIGHT_LDIR_BLEND
-#define LIGHT_LDIR_BLEND 0.5f
+#define LIGHT_LDIR_BLEND 0.0f
 #endif
