@@ -279,48 +279,78 @@ float3 pointcam_lighting_grad_approx(
     float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
     V = normalize_or_default(V, make_float3(0.f, 0.f, -1.f));
 
-    // L = normalize(light_pos - P)
-    float3 Lraw = make_float3(light_pos.x - P.x, light_pos.y - P.y, light_pos.z - P.z);
-    float3 L = normalize_or_default(Lraw, make_float3(0.f, 0.f, -1.f));
+    // point-light direction
+float3 Lpoint_raw = make_float3(light_pos.x - P.x, light_pos.y - P.y, light_pos.z - P.z);
+float3 L_point = normalize_or_default(Lpoint_raw, make_float3(0.f, 0.f, -1.f));
 
-    float3 Hraw = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
-    float3 H = normalize_or_default(Hraw, make_float3(0.f, 0.f, -1.f));
+// blended light direction
+const float lambda = LIGHT_LDIR_BLEND;
+float3 Lblend_raw = make_float3(
+    (1.0f - lambda) * L_point.x + lambda * V.x,
+    (1.0f - lambda) * L_point.y + lambda * V.y,
+    (1.0f - lambda) * L_point.z + lambda * V.z
+);
+float3 L = normalize_or_default(Lblend_raw, make_float3(0.f, 0.f, -1.f));
+
+float3 Hraw = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
+float3 H = normalize_or_default(Hraw, make_float3(0.f, 0.f, -1.f));
 
     float3 gP = make_float3(0.f, 0.f, 0.f);
 
-    // -------- diffuse via ndotl wrt L(P) --------
+// -------- diffuse via ndotl wrt L(P) --------
 #if LIGHT_USE_LAMBERT
+{
+    float dL_dlambert = dL_ddiffuse * Lout.spot * Lout.intensity;
+    #if LIGHT_ENERGY_COMP
+        dL_dlambert *= (1.0f - Lout.kspec);
+    #endif
+
+    float dL_dndotl = 0.0f;
+    #if LIGHT_LAMBERT_ABS
+        if (Lout.ndotl > 0.0f) dL_dndotl = dL_dlambert;
+        else if (Lout.ndotl < 0.0f) dL_dndotl = -dL_dlambert;
+    #else
+        if (Lout.ndotl > 0.0f) dL_dndotl = dL_dlambert;
+    #endif
+
+    if (dL_dndotl != 0.0f)
     {
-        float dL_dlambert = dL_ddiffuse * Lout.spot * Lout.intensity;
-        #if LIGHT_ENERGY_COMP
-            dL_dlambert *= (1.0f - Lout.kspec);
-        #endif
+        // ndotl = dot(n_used, L)
+        float3 gL = make_float3(
+            dL_dndotl * n_used.x,
+            dL_dndotl * n_used.y,
+            dL_dndotl * n_used.z
+        );
 
-        float dL_dndotl = 0.0f;
-        #if LIGHT_LAMBERT_ABS
-            if (Lout.ndotl > 0.0f) dL_dndotl = dL_dlambert;
-            else if (Lout.ndotl < 0.0f) dL_dndotl = -dL_dlambert;
-        #else
-            if (Lout.ndotl > 0.0f) dL_dndotl = dL_dlambert;
-        #endif
+        // back through final normalize(Lblend_raw)
+        float3 gLblend_raw = apply_norm_jacobian(Lblend_raw, gL);
 
-        if (dL_dndotl != 0.0f)
-        {
-            // ndotl = dot(n_used, L)
-            // d(ndotl)/dL = n_used
-            float3 gL = make_float3(
-                dL_dndotl * n_used.x,
-                dL_dndotl * n_used.y,
-                dL_dndotl * n_used.z
-            );
+        // Lblend_raw = (1-lambda)*L_point + lambda*V
+        float3 gL_point = make_float3(
+            (1.0f - lambda) * gLblend_raw.x,
+            (1.0f - lambda) * gLblend_raw.y,
+            (1.0f - lambda) * gLblend_raw.z
+        );
+        float3 gV = make_float3(
+            lambda * gLblend_raw.x,
+            lambda * gLblend_raw.y,
+            lambda * gLblend_raw.z
+        );
 
-            // L = normalize(light_pos - P), so dL/dP = -J_norm(Lraw)
-            float3 gLraw = apply_norm_jacobian(Lraw, gL);
-            gP.x -= gLraw.x;
-            gP.y -= gLraw.y;
-            gP.z -= gLraw.z;
-        }
+        // L_point = normalize(Lpoint_raw)
+        float3 gLpoint_raw = apply_norm_jacobian(Lpoint_raw, gL_point);
+        gP.x -= gLpoint_raw.x;
+        gP.y -= gLpoint_raw.y;
+        gP.z -= gLpoint_raw.z;
+
+        // V = normalize(-P)
+        float3 negP = make_float3(-P.x, -P.y, -P.z);
+        float3 gNegP = apply_norm_jacobian(negP, gV);
+        gP.x -= gNegP.x;
+        gP.y -= gNegP.y;
+        gP.z -= gNegP.z;
     }
+}
 #endif
 
     // -------- spec via ndoth wrt H(P) --------
@@ -354,22 +384,42 @@ float3 pointcam_lighting_grad_approx(
 
                 float3 gHraw = apply_norm_jacobian(Hraw, gH);
 
-                // Hraw = L + V
-                float3 gL = gHraw;
-                float3 gV = gHraw;
+// Hraw = L + V
+float3 gL = gHraw;
+float3 gV_from_H = gHraw;
 
-                // V = normalize(-P)
-                float3 negP = make_float3(-P.x, -P.y, -P.z);
-                float3 gNegP = apply_norm_jacobian(negP, gV);
-                gP.x -= gNegP.x;
-                gP.y -= gNegP.y;
-                gP.z -= gNegP.z;
+// back through blended L
+float3 gLblend_raw = apply_norm_jacobian(Lblend_raw, gL);
 
-                // L = normalize(light_pos - P)
-                float3 gLraw = apply_norm_jacobian(Lraw, gL);
-                gP.x -= gLraw.x;
-                gP.y -= gLraw.y;
-                gP.z -= gLraw.z;
+float3 gL_point = make_float3(
+    (1.0f - lambda) * gLblend_raw.x,
+    (1.0f - lambda) * gLblend_raw.y,
+    (1.0f - lambda) * gLblend_raw.z
+);
+float3 gV_from_L = make_float3(
+    lambda * gLblend_raw.x,
+    lambda * gLblend_raw.y,
+    lambda * gLblend_raw.z
+);
+
+float3 gV_total = make_float3(
+    gV_from_H.x + gV_from_L.x,
+    gV_from_H.y + gV_from_L.y,
+    gV_from_H.z + gV_from_L.z
+);
+
+// V = normalize(-P)
+float3 negP = make_float3(-P.x, -P.y, -P.z);
+float3 gNegP = apply_norm_jacobian(negP, gV_total);
+gP.x -= gNegP.x;
+gP.y -= gNegP.y;
+gP.z -= gNegP.z;
+
+// L_point = normalize(Lpoint_raw)
+float3 gLpoint_raw = apply_norm_jacobian(Lpoint_raw, gL_point);
+gP.x -= gLpoint_raw.x;
+gP.y -= gLpoint_raw.y;
+gP.z -= gLpoint_raw.z;
             }
         }
     }
@@ -555,15 +605,24 @@ LightingOut eval_lighting(
     const float comp = 0.01f * 0.70710678f;
     const float3 light_pos = make_float3(-comp, -comp, 0.0f);
 
-    // surface -> light
-    float3 L = make_float3(light_pos.x - P.x,
-                           light_pos.y - P.y,
-                           light_pos.z - P.z);
-    L = normalize_or_default(L, make_float3(0.f, 0.f, -1.f));
-
     // surface -> camera
-    float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
-    V = normalize_or_default(V, make_float3(0.f, 0.f, -1.f));
+float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
+V = normalize_or_default(V, make_float3(0.f, 0.f, -1.f));
+
+// point-light direction
+float3 L_point = make_float3(light_pos.x - P.x,
+                             light_pos.y - P.y,
+                             light_pos.z - P.z);
+L_point = normalize_or_default(L_point, make_float3(0.f, 0.f, -1.f));
+
+// blended light direction: point light <-> headlight
+const float lambda = LIGHT_LDIR_BLEND;
+float3 L = make_float3(
+    (1.0f - lambda) * L_point.x + lambda * V.x,
+    (1.0f - lambda) * L_point.y + lambda * V.y,
+    (1.0f - lambda) * L_point.z + lambda * V.z
+);
+L = normalize_or_default(L, make_float3(0.f, 0.f, -1.f));
 
     // Stabilization
     float nv_raw = fmaxf(-(n.x * view_ray.x + n.y * view_ray.y + n.z * view_ray.z), 0.0f);

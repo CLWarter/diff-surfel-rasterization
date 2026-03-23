@@ -107,7 +107,7 @@
 #endif
 
 #ifndef FALLOFF_K
-#define FALLOFF_K 0.1f
+#define FALLOFF_K 0.001f
 #endif
 
 #ifndef FALLOFF_Z_GRAD_SCALE
@@ -254,4 +254,12 @@
 
 #ifndef LIGHT_WEAK_SHADE_REDUCTION
 #define LIGHT_WEAK_SHADE_REDUCTION 0.75f
+#endif
+
+#ifndef LIGHT_DEEP_SHADE
+#define LIGHT_DEEP_SHADE 0.2f   // deeper layers get 20% shading
+#endif
+
+#ifndef LIGHT_LDIR_BLEND
+#define LIGHT_LDIR_BLEND 0.5f
 #endif

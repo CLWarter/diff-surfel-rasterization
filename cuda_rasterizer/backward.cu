@@ -307,6 +307,21 @@ renderCUDA(
 			if (contributor >= last_contributor)
 				continue;
 
+				// ------------------------------------------------------------
+// Layer-based shading gate (front = 1, deeper = reduced)
+// ------------------------------------------------------------
+float layer_w = 0.0f;
+
+// simple version: only front-most
+if (contributor == last_contributor - 1)
+{
+    layer_w = 1.0f;
+}
+else
+{
+    layer_w = LIGHT_DEEP_SHADE; // e.g. 0.1–0.3
+}
+
 			// compute ray-splat intersection as before
 			// Fisrt compute two homogeneous planes, See Eq. (8)
 			const float2 xy = collected_xy[j];
@@ -450,10 +465,16 @@ renderCUDA(
 					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 					last_color[ch] = c;
 
-					float eff = Lout.diffuse_mul * c;
-					#if LIGHT_USE_PHONG
-						if (ch < 3) eff += Lout.spec_add;
-					#endif
+float diffuse_term = Lout.diffuse_mul * c;
+float spec_term = 0.0f;
+
+#if LIGHT_USE_PHONG
+    if (ch < 3) spec_term = Lout.spec_add;
+#endif
+
+// Apply layer gating ONLY to directional part
+float eff = layer_w * (diffuse_term + spec_term)
+          + (1.0f - layer_w) * c;  // fallback to base color
 
 					accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
 					last_eff[ch] = eff;
@@ -462,9 +483,9 @@ renderCUDA(
 					dL_dalpha += (eff - accum_eff[ch]) * dL_dchannel;
 
 					// gradients needed for spec path
-					dL_ddiffuse += dL_dchannel * (w * c);
+					dL_ddiffuse += dL_dchannel * (w * c * layer_w);
 					#if LIGHT_USE_PHONG
-						if (ch < 3) dL_dspec += dL_dchannel * w;
+						if (ch < 3) dL_dspec += dL_dchannel * (w * layer_w);
 					#endif
 
 					// base color gradient
@@ -713,13 +734,21 @@ renderCUDA(
 				const float comp = 0.01f * 0.70710678f;
 				const float3 light_pos = make_float3(-comp, -comp, 0.0f);
 
-				float3 Lvec = make_float3(light_pos.x - point_cam.x,
-										  light_pos.y - point_cam.y,
-										  light_pos.z - point_cam.z);
-				Lvec = normalize_or_default(Lvec, make_float3(0.f, 0.f, -1.f));
+float3 Vvec = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
+Vvec = normalize_or_default(Vvec, make_float3(0.f, 0.f, -1.f));
 
-				float3 Vvec = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
-				Vvec = normalize_or_default(Vvec, make_float3(0.f, 0.f, -1.f));
+float3 Lpoint = make_float3(light_pos.x - point_cam.x,
+                            light_pos.y - point_cam.y,
+                            light_pos.z - point_cam.z);
+Lpoint = normalize_or_default(Lpoint, make_float3(0.f, 0.f, -1.f));
+
+const float lambda = LIGHT_LDIR_BLEND;
+float3 Lvec = make_float3(
+    (1.0f - lambda) * Lpoint.x + lambda * Vvec.x,
+    (1.0f - lambda) * Lpoint.y + lambda * Vvec.y,
+    (1.0f - lambda) * Lpoint.z + lambda * Vvec.z
+);
+Lvec = normalize_or_default(Lvec, make_float3(0.f, 0.f, -1.f));
 
 				// Half vector (same as forward)
 				float3 Hh = normalize_or_default(
