@@ -319,7 +319,7 @@ renderCUDA(
 			float3 k = pix.x * Tw - Tu;
 			float3 l = pix.y * Tw - Tv;
 			float3 p = cross(k, l);
-			if (p.z == 0.0) continue;
+			if (fabsf(p.z) < 1e-8f) continue;
 			float2 s = {p.x / p.z, p.y / p.z};
 			float rho3d = (s.x * s.x + s.y * s.y); 
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
@@ -450,7 +450,7 @@ renderCUDA(
 					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 					last_color[ch] = c;
 
-					float eff = Lout.diffuse_mul * c;
+					float eff = (Lout.diffuse_amb + Lout.diffuse_dir) * c;
 					#if LIGHT_USE_PHONG
 						if (ch < 3) eff += Lout.spec_add;
 					#endif
@@ -473,32 +473,28 @@ renderCUDA(
 
 			// -------- intensity (falloff) to depth gradient --------
 			{
-				// d(diffuse_mul)/dLi
 				float dDiff_dLi = 0.0f;
-			#if LIGHT_USE_LAMBERT
-				// diffuse = a + (1-a)*lambert*spot*Li
-				dDiff_dLi = Lout.lambert * Lout.spot;
+				#if LIGHT_USE_LAMBERT
+					// only directional diffuse depends on Li
+					dDiff_dLi = Lout.lambert * Lout.spot;
 
-				#if LIGHT_ENERGY_COMP
-					// forward does: diffuse *= (1-ks)
-					dDiff_dLi *= (1.0f - Lout.kspec);
+					#if LIGHT_ENERGY_COMP
+						dDiff_dLi *= (1.0f - Lout.kspec);
+					#endif
 				#endif
-			#endif
 
-				// d(spec_add)/dLi
 				float dSpec_dLi = 0.0f;
-			#if LIGHT_USE_PHONG
-				// spec_base = spec_pow * spot * Li, then spec_add = ks * spec_base (with gating applied to spec_base)
-				float base = Lout.spec_pow * Lout.spot;
+				#if LIGHT_USE_PHONG
+					float base = Lout.kspec * Lout.spec_pow * Lout.spot;
 
-				#if (LIGHT_SPEC_GATING == 1)
-					if (Lout.ndotl <= 0.0f) base = 0.0f;
-				#elif (LIGHT_SPEC_GATING == 2)
-					base *= Lout.lambert;
+					#if (LIGHT_SPEC_GATING == 1)
+						if (Lout.ndotl <= 0.0f) base = 0.0f;
+					#elif (LIGHT_SPEC_GATING == 2)
+						base *= Lout.lambert;
+					#endif
+
+					dSpec_dLi = base;
 				#endif
-
-				dSpec_dLi = Lout.kspec * base;
-			#endif
 
 				float dL_dLi = dL_ddiffuse * dDiff_dLi + dL_dspec * dSpec_dLi;
 
@@ -536,13 +532,15 @@ renderCUDA(
 						// shade_conf = surface_conf * shade_base
 						// so dLi/dsurface_conf = Li / surface_conf  (unclamped Li case)
 						float dLi_dsurfaceconf = 0.0f;
-					#if (LIGHT_LI_CLAMP > 0)
-						if (Lout.li_clamped <= 0.5f && surface_conf > 1e-8f)
-							dLi_dsurfaceconf = Lout.intensity / surface_conf;
-					#else
-						if (surface_conf > 1e-8f)
-							dLi_dsurfaceconf = Lout.intensity / surface_conf;
-					#endif
+						float shade_base = Lout.shade_conf / fmaxf(surface_conf, 1e-8f);
+
+						#if (LIGHT_LI_CLAMP > 0)
+							if (Lout.li_clamped <= 0.5f && surface_conf > 1e-8f)
+								dLi_dsurfaceconf = Lout.Li_raw * shade_base;
+						#else
+							if (surface_conf > 1e-8f)
+								dLi_dsurfaceconf = Lout.Li_raw * shade_base;
+						#endif
 
 						float dL_ddisp = dL_dLi * dLi_dsurfaceconf * dsurfaceconf_ddisp;
 
@@ -584,11 +582,11 @@ renderCUDA(
 					float Li_raw_unclamped = 0.0f;
 				#if (LIGHT_LI_CLAMP > 0)
 					if (Lout.li_clamped <= 0.5f)
-						Li_raw_unclamped = Lout.intensity / fmaxf(Lout.shade_conf, 1e-8f);
+						Li_raw_unclamped = Lout.Li_raw;
 					else
 						Li_raw_unclamped = 0.0f; // hard clamp => zero local gradient
 				#else
-					Li_raw_unclamped = Lout.intensity / fmaxf(Lout.shade_conf, 1e-8f);
+					Li_raw_unclamped = Lout.Li_raw;
 				#endif
 
 					float dLi_dalpha_local = Li_raw_unclamped * dshadeconf_dalpha;
@@ -610,10 +608,11 @@ renderCUDA(
 
 				// ---- intensity learnable (per-scene) gradient ----
 				{
-					// Li = I * inv  => dLi/dI = inv
-					float dL_dI    = (dL_dLi * li_grad_gate) * Lout.inv * Lout.shade_conf;
+					// Li = I * inv * shade_conf  => dLi/dI = inv * shade_conf
+					float dL_dI = (dL_dLi * li_grad_gate) * Lout.inv * Lout.shade_conf;
 
-					// I = I_MIN + (I_MAX-I_MIN)*sigmoid(I_raw) -> dI/dI_raw = dI_raw
+					// I = softplus_beta2(clamp(I_raw, -15, 15))
+					// Lout.dI_raw already stores dI/dI_raw including the clamp gate
 					float dL_dIraw = dL_dI * Lout.dI_raw;
 
 					// per-scene scalar gradient
@@ -635,10 +634,6 @@ renderCUDA(
 			{
 				float d_diffuse_da = 1.0f;
 
-				#if LIGHT_ENERGY_COMP
-					d_diffuse_da *= (1.0f - Lout.kspec);
-				#endif
-
 				const float amax = 0.25f;
 				float t = sigmoidf_stable(ambients[0]);
 				float da_draw = amax * t * (1.0f - t);
@@ -650,12 +645,12 @@ renderCUDA(
 			// ----- kspecular gradient (learned scalar) -----
 			#if LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
 			{
-				const float dspecadd_dks = Lout.spec_base;
+				const float dspecadd_dks = Lout.spec_dir_gated;
 
-				// diffuse energy compensation term
 				float ddiffmul_dks = 0.0f;
 				#if LIGHT_ENERGY_COMP && LIGHT_USE_LAMBERT
-					ddiffmul_dks = -Lout.diffuse_base;
+					// only directional diffuse depends on ks through energy compensation
+					ddiffmul_dks = -Lout.diffuse_dir_raw;
 				#endif
 
 				const float dL_dks = dL_dspec * dspecadd_dks + dL_ddiffuse * ddiffmul_dks;
@@ -673,7 +668,7 @@ renderCUDA(
 					const float ln_ndoth = logf(fmaxf(ndoth, 1e-8f));
 					const float dspecpow_dshin = Lout.spec_pow * ln_ndoth;
 
-					const float mult = (Lout.spec_pow > 0.0f) ? (Lout.spec_base / Lout.spec_pow) : 0.0f;
+					const float mult = (Lout.spec_pow > 0.0f) ? (Lout.spec_dir_gated / Lout.spec_pow) : 0.0f;
 					const float dspecadd_dshin = Lout.kspec * (mult * dspecpow_dshin);
 
 					atomicAdd(&dL_dshiny[global_id], dL_dspec * dspecadd_dshin * Lout.dshin_raw);
@@ -733,13 +728,6 @@ renderCUDA(
 				float dL_dndotl = 0.0f;
 				#if LIGHT_USE_LAMBERT
 				{
-					float a = 0.0f;
-					#if (LIGHT_AMBIENT_MODE == 2)
-						a = Lout.ambient;
-					#elif (LIGHT_AMBIENT_MODE == 1)
-						a = LIGHT_AMBIENT_FIXED;
-					#endif
-
 					float dL_dlambert = dL_ddiffuse * Lout.spot * Lout.intensity;
 					#if LIGHT_ENERGY_COMP
 						dL_dlambert *= (1.0f - Lout.kspec);
@@ -781,17 +769,24 @@ renderCUDA(
 
 				// Specular ndoth contribution
 				#if LIGHT_USE_PHONG
+				{
+					const float NDOTH_MAX = 0.95f;
+					const float ndoth = Lout.ndoth; // forward-used clamped value
+					const float ndoth_raw = n_unit.x * Hh.x + n_unit.y * Hh.y + n_unit.z * Hh.z;
+
+					if (dL_dspec != 0.0f)
 					{
-						const float ndoth = Lout.ndoth;
-						if (ndoth > 0.0f && dL_dspec != 0.0f)
+						float dL_dndoth = 0.0f;
+
+						// derivative wrt ndoth_raw only exists in unclamped interval
+						if (ndoth_raw > 0.0f && ndoth_raw < NDOTH_MAX)
 						{
-							// d/d(ndoth) of ndoth^shiny
-							float spec_deriv = 0;
+							float spec_deriv = 0.0f;
 							const float nd_eps = 1e-6f;
-							if (ndoth > nd_eps) {
+
+							if (ndoth > nd_eps)
+							{
 								spec_deriv = Lout.shiny * (Lout.spec_pow / ndoth);
-							} else {
-								spec_deriv = 0.0f;
 							}
 
 							float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot * Lout.intensity;
@@ -802,19 +797,47 @@ renderCUDA(
 								dspec_dndoth *= Lout.lambert;
 							#endif
 
-							const float dL_dndoth = dL_dspec * dspec_dndoth;
+							dL_dndoth = dL_dspec * dspec_dndoth;
+						}
 
-							// accumulate into unit-normal gradient
+						// accumulate into unit-normal gradient
+						if (dL_dndoth != 0.0f)
+						{
 							g_unit.x += dL_dndoth * Hh.x;
 							g_unit.y += dL_dndoth * Hh.y;
 							g_unit.z += dL_dndoth * Hh.z;
 						}
 					}
+				}
 				#endif
 
 				// Map gradient back to raw normal space through normalization Jacobian
 				// back through final normalize(n_stable)
 				float3 g_nstable = apply_norm_jacobian(n_stable, g_unit);
+
+				float raw_blend = LIGHT_NORMAL_VIEW_BLEND * grazing_t + alpha_boost;
+
+				// from n_stable = (1-blend_w)*n_pre + blend_w*n_view
+				// dL/d(blend_w) = dot(g_nstable, n_view - n_pre)
+				float g_blend =
+					g_nstable.x * (n_view.x - n_pre.x) +
+					g_nstable.y * (n_view.y - n_pre.y) +
+					g_nstable.z * (n_view.z - n_pre.z);
+
+				// saturate gate: derivative only in open interval (0,1)
+				float g_raw_blend = 0.0f;
+				if (raw_blend > 0.0f && raw_blend < 1.0f)
+					g_raw_blend = g_blend;
+
+				// alpha_boost = alpha_weak * LIGHT_NORMAL_ALPHA_BOOST
+				// alpha_weak = 1 - saturate01(alpha / LIGHT_ALPHA_SOFT_REF)
+				// so for 0 < alpha < LIGHT_ALPHA_SOFT_REF:
+				// d(alpha_boost)/d(alpha) = -LIGHT_NORMAL_ALPHA_BOOST / LIGHT_ALPHA_SOFT_REF
+				if (alpha > 0.0f && alpha < LIGHT_ALPHA_SOFT_REF)
+				{
+					float dalphaboost_dalpha = -LIGHT_NORMAL_ALPHA_BOOST / LIGHT_ALPHA_SOFT_REF;
+					dL_dalpha += g_raw_blend * dalphaboost_dalpha;
+				}
 
 				// back through affine blend, treating blend_w as constant
 				float3 g_npre = make_float3(
@@ -907,7 +930,7 @@ renderCUDA(
 
 		// ========== END LAMBERT + PHONG SHADING (BACKWARD) ========================
 
-            float dL_dweight = 0;
+        float dL_dweight = 0;
 
 #if RENDER_AXUTILITY
 			const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
@@ -1000,12 +1023,20 @@ renderCUDA(
 				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
 			} else {
-				// // Update gradients w.r.t. center of Gaussian 2D mean position
+				// Update gradients w.r.t. center of Gaussian 2D mean position
+
+				// Correct indices for x and y gradients
 				const float dG_ddelx = -G * FilterInvSquare * d.x;
 				const float dG_ddely = -G * FilterInvSquare * d.y;
-				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
-				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
-				// // Propagate the gradients of depth
+
+				float spatial_clamp = 10.0f; // Adjust based on scene scale
+				float clamped_sx = fmaxf(-spatial_clamp, fminf(spatial_clamp, extra_dL_dsx));
+    			float clamped_sy = fmaxf(-spatial_clamp, fminf(spatial_clamp, extra_dL_dsy));
+
+				atomicAdd(&dL_dmean2D[global_id].x, (dL_dG * dG_ddelx) + clamped_sx);	// Update X
+				atomicAdd(&dL_dmean2D[global_id].y, (dL_dG * dG_ddely) + clamped_sy);   // Update Y
+
+				// Propagate the gradients of depth
 				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  s.x * dL_dz);
 				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  s.y * dL_dz);
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz);
