@@ -107,7 +107,7 @@
 #endif
 
 #ifndef FALLOFF_K
-#define FALLOFF_K 0.1f
+#define FALLOFF_K 0.01f
 #endif
 
 #ifndef FALLOFF_Z_GRAD_SCALE
@@ -122,16 +122,15 @@
 // Hard clamp of Li = I * inv to prevent white splat spikes.
 // 0 to disable the clamp.
 #ifndef LIGHT_LI_CLAMP
-#define LIGHT_LI_CLAMP 0
+#define LIGHT_LI_CLAMP 1
 #endif
-
 
 // ------------------ Specular gating ------------------
 // 0 = none
 // 1 = backface gate only: spec = 0 if ndotl <= 0
 // 2 = scale by lambert
 #ifndef LIGHT_SPEC_GATING
-#define LIGHT_SPEC_GATING 2
+#define LIGHT_SPEC_GATING 1
 #endif
 
 // ------------------ Energy compensation ------------------
@@ -159,7 +158,7 @@
 
 // smooth ramp
 #ifndef LIGHT_SPOT_EXP
-#define LIGHT_SPOT_EXP 1.0f
+#define LIGHT_SPOT_EXP 0.65f // Maybe reduce further to 0.5
 #endif
 
 // Light constants
@@ -205,23 +204,23 @@
 #endif
 
 #ifndef LIGHT_NORMAL_VIEW_BLEND
-#define LIGHT_NORMAL_VIEW_BLEND 0.20f
+#define LIGHT_NORMAL_VIEW_BLEND 0.35f
 #endif
 
 #ifndef LIGHT_NORMAL_GRAZING_START
-#define LIGHT_NORMAL_GRAZING_START 0.35f
+#define LIGHT_NORMAL_GRAZING_START 0.50f
 #endif
 
 #ifndef LIGHT_NORMAL_GRAZING_END
-#define LIGHT_NORMAL_GRAZING_END 0.05f
+#define LIGHT_NORMAL_GRAZING_END 0.15f
 #endif
 
 #ifndef LIGHT_CONF_LOW_ALPHA
-#define LIGHT_CONF_LOW_ALPHA 0.65f
+#define LIGHT_CONF_LOW_ALPHA 0.50f
 #endif
 
 #ifndef LIGHT_CONF_GRAZING
-#define LIGHT_CONF_GRAZING 0.75f
+#define LIGHT_CONF_GRAZING 0.55f
 #endif
 
 #ifndef LIGHT_CONF_DISP_K
@@ -241,7 +240,7 @@
 #endif
 
 #ifndef LIGHT_ALPHA_SKIP_THRESHOLD
-#define LIGHT_ALPHA_SKIP_THRESHOLD (1.0f / 255.0f)
+#define LIGHT_ALPHA_SKIP_THRESHOLD (1.5f / 255.0f)
 #endif
 
 #ifndef LIGHT_NORMAL_CONF_BOOST

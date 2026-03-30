@@ -581,7 +581,7 @@ renderCUDA(
 					// blue = clamped
 					C[0] = (!reliable_hit || !sane_hit) ? 1.0f : 0.0f;
 					C[1] = (reliable_hit && sane_hit) ? 1.0f : 0.0f;
-					C[2] = 0.0f;
+					C[2] = hit_was_clamped ? 1.0f : 0.0f;
 
 				#elif (LIGHT_DEBUG_MODE == 6)
 					// displacement of point_cam from center_cam
@@ -595,7 +595,7 @@ renderCUDA(
 
 				#elif (LIGHT_DEBUG_MODE == 8)
 					// learned ambient
-					dbg = ambients[gid] * LIGHT_DEBUG_SCALE;
+					dbg = Lout.ambient * LIGHT_DEBUG_SCALE;
 
 				#elif (LIGHT_DEBUG_MODE == 9)
 					// learned intensity value as seen by eval_lighting

@@ -4,6 +4,8 @@
 struct LightingOut {
     float diffuse_mul;  // multiplied to base color
     float diffuse_base; // diffuse without energy compensation
+    float diffuse_dir;   // directional diffuse only
+    float diffuse_amb;   // ambient/base diffuse only
 
     float spec_add;    // additive spec
     float spec_base;   // spec without ks
@@ -499,6 +501,8 @@ LightingOut eval_lighting(
     // defaults (no lighting)
     o.diffuse_mul = 1.0f;
     o.diffuse_base = 1.0f;
+    o.diffuse_amb = 1.0f;
+    o.diffuse_dir = 1.0f;
     o.spec_add    = 0.0f;
     o.spec_base   = 0.0f;
     o.spec_pow    = 0.0f;
@@ -705,11 +709,20 @@ LightingOut eval_lighting(
 
         o.diffuse_base = diffuse_base;
 
-    #if LIGHT_ENERGY_COMP && LIGHT_USE_PHONG
-        diffuse_base *= (1.0f - o.kspec);
-    #endif
+        float diffuse_dir = lambert * spot * Li;
+        #if LIGHT_ENERGY_COMP && LIGHT_USE_PHONG
+            diffuse_dir *= (1.0f - o.kspec);
+        #endif
 
-        o.diffuse_mul = diffuse_base;
+        float diffuse_amb = 0.0f;
+        #if (LIGHT_AMBIENT_MODE != 0)
+            diffuse_amb = a;
+        #endif
+
+        o.diffuse_dir  = diffuse_dir;
+        o.diffuse_amb  = diffuse_amb;
+        o.diffuse_base = diffuse_dir + diffuse_amb;
+        o.diffuse_mul  = o.diffuse_base;
 #endif
 
     // phong spec
