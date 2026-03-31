@@ -7,9 +7,15 @@ struct LightingOut {
     float spec_add;      // final additive specular
 
     // diffuse decomposition
-    float diffuse_amb;       // additive ambient/base term
-    float diffuse_dir_raw;   // lambert * spot * Li
-    float diffuse_dir;       // directional diffuse after optional energy compensation
+    float diffuse_brdf;     // e.g. 1/pi for Lambert
+    float indirect_diffuse; // ambient / indirect approximation
+    float direct_diffuse_raw; // brdf * lambert * spot * Li
+    float direct_diffuse;     // after optional energy compensation
+
+    // legacy-compatible aliases
+    float diffuse_amb;      // same as indirect_diffuse
+    float diffuse_dir_raw;  // same as direct_diffuse_raw
+    float diffuse_dir;      // same as direct_diffuse
 
     // spec decomposition
     float spec_pow;         // ndoth^shiny
@@ -303,7 +309,7 @@ float3 pointcam_lighting_grad_approx(
         // diffuse contribution
         #if LIGHT_USE_LAMBERT
         {
-            float dLambert_from_diffuse = dL_ddiffuse * Lout.spot * Lout.intensity;
+            float dLambert_from_diffuse = dL_ddiffuse * Lout.diffuse_brdf * Lout.spot * Lout.intensity;
             #if LIGHT_ENERGY_COMP
                 dLambert_from_diffuse *= (1.0f - Lout.kspec);
             #endif
@@ -436,7 +442,7 @@ float3 pointcam_lighting_grad_approx(
 
             float dDiffuse_dSpot = 0.0f;
             #if LIGHT_USE_LAMBERT
-                dDiffuse_dSpot = dL_ddiffuse * Lout.lambert * Lout.intensity;
+                dDiffuse_dSpot = dL_ddiffuse * Lout.diffuse_brdf * Lout.lambert * Lout.intensity;
                 #if LIGHT_ENERGY_COMP
                     dDiffuse_dSpot *= (1.0f - Lout.kspec);
                 #endif
@@ -471,7 +477,7 @@ float3 pointcam_lighting_grad_approx(
     {
         float dDiff_dLi = 0.0f;
         #if LIGHT_USE_LAMBERT
-            dDiff_dLi = Lout.lambert * Lout.spot;
+            dDiff_dLi = Lout.diffuse_brdf * Lout.lambert * Lout.spot;
             #if LIGHT_ENERGY_COMP
                 dDiff_dLi *= (1.0f - Lout.kspec);
             #endif
@@ -530,41 +536,48 @@ LightingOut eval_lighting(
     float surface_conf = 1.0f,
     float alpha_local = 1.0f
 ) {
-LightingOut o = {};
-o.diffuse_mul      = 1.0f;
-o.spec_add         = 0.0f;
+    LightingOut o = {};
+    o.diffuse_mul        = 1.0f;
+    o.spec_add           = 0.0f;
 
-o.diffuse_amb      = 0.0f;
-o.diffuse_dir_raw  = 0.0f;
-o.diffuse_dir      = 1.0f;
+    o.diffuse_brdf       = 0.0f;
 
-o.spec_pow        = 0.0f;
-o.spec_dir_raw     = 0.0f;
-o.spec_dir_gated   = 0.0f;
-o.spec_base        = 0.0f;
+    o.indirect_diffuse   = 0.0f;
+    o.direct_diffuse_raw = 0.0f;
+    o.direct_diffuse     = 0.0f;
 
-o.lambert          = 1.0f;
-o.ndotl            = 1.0f;
-o.ndotv            = 1.0f;
-o.ndoth            = 0.0f;
-o.spot             = 1.0f;
+    // legacy-compatible aliases
+    o.diffuse_amb        = 0.0f;
+    o.diffuse_dir_raw    = 0.0f;
+    o.diffuse_dir        = 0.0f;
 
-o.ambient          = 0.0f;
-o.intensity        = 1.0f;
-o.inv              = 1.0f;
-o.dintensity_ddepth = 0.0f;
-o.li_clamped       = 0.0f;
-o.Li = 0.0f;
-o.Li_raw = 0.0f;
-o.I = 0.0f;
+    o.spec_pow           = 0.0f;
+    o.spec_dir_raw       = 0.0f;
+    o.spec_dir_gated     = 0.0f;
+    o.spec_base          = 0.0f;
 
-o.dI_raw           = 0.0f;
-o.kspec            = 0.0f;
-o.dkspecular       = 0.0f;
-o.shiny            = LIGHT_PHONG_SHININESS;
-o.dshin_raw        = 0.0f;
+    o.lambert            = 1.0f;
+    o.ndotl              = 1.0f;
+    o.ndotv              = 1.0f;
+    o.ndoth              = 0.0f;
+    o.spot               = 1.0f;
 
-o.shade_conf       = 1.0f;
+    o.ambient            = 0.0f;
+    o.intensity          = 1.0f;
+    o.inv                = 1.0f;
+    o.dintensity_ddepth  = 0.0f;
+    o.li_clamped         = 0.0f;
+    o.Li                 = 0.0f;
+    o.Li_raw             = 0.0f;
+    o.I                  = 0.0f;
+
+    o.dI_raw             = 0.0f;
+    o.kspec              = 0.0f;
+    o.dkspecular         = 0.0f;
+    o.shiny              = LIGHT_PHONG_SHININESS;
+    o.dshin_raw          = 0.0f;
+
+    o.shade_conf         = 1.0f;
 
 #if (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
     float3 n = normalize_or_default(n_raw, make_float3(0.f, 0.f, 1.f));
@@ -665,6 +678,7 @@ o.shade_conf       = 1.0f;
     // intensity
     float dI_draw = 0.0f;
     float I = intensity_value(intensity, &dI_draw);
+    o.I = I;
     o.dI_raw = dI_draw; // dI/d(raw) if learnable, else 0
 
     // ------------------------------------------------------------
@@ -705,15 +719,15 @@ o.shade_conf       = 1.0f;
     o.dintensity_ddepth = 0.0f;
 #endif
 
-     o.inv = inv;
+    o.inv = inv;
 
     o.Li_raw = I * inv;
-    o.I = I;
 
 float alpha_conf = saturate01(alpha_local / LIGHT_ALPHA_SOFT_REF);
 float shade_conf = surface_conf * ((1.0f - LIGHT_WEAK_SHADE_REDUCTION) + LIGHT_WEAK_SHADE_REDUCTION * alpha_conf);
 
 float Li = o.Li_raw * shade_conf;
+
 #if (LIGHT_LI_CLAMP > 0)
     if (Li > (float)LIGHT_LI_CLAMP) {
         Li = (float)LIGHT_LI_CLAMP;
@@ -749,28 +763,37 @@ o.intensity = Li;
 
 // diffuse decomposition
 #if LIGHT_USE_LAMBERT
-    float diffuse_dir_raw = lambert * spot * Li;
-    float diffuse_dir = diffuse_dir_raw;
+    o.diffuse_brdf = 1.0f / LIGHT_PI;
+
+    o.direct_diffuse_raw = o.diffuse_brdf * lambert * spot * Li;
+    o.direct_diffuse     = o.direct_diffuse_raw;
 
     #if LIGHT_ENERGY_COMP && LIGHT_USE_PHONG
-        diffuse_dir *= (1.0f - o.kspec);
+        o.direct_diffuse *= (1.0f - o.kspec);
     #endif
 
-    float diffuse_amb = 0.0f;
     #if (LIGHT_AMBIENT_MODE != 0)
-        diffuse_amb = a;
+        o.indirect_diffuse = a;
+    #else
+        o.indirect_diffuse = 0.0f;
     #endif
 
-    o.diffuse_dir_raw = diffuse_dir_raw;
-    o.diffuse_dir     = diffuse_dir;
-    o.diffuse_amb     = diffuse_amb;
+    o.diffuse_mul = o.indirect_diffuse + o.direct_diffuse;
 
-    o.diffuse_mul     = diffuse_amb + diffuse_dir;
+    o.diffuse_amb     = o.indirect_diffuse;
+    o.diffuse_dir_raw = o.direct_diffuse_raw;
+    o.diffuse_dir     = o.direct_diffuse;
+
 #else
-    o.diffuse_dir_raw = 0.0f;
-    o.diffuse_dir     = 0.0f;
-    o.diffuse_amb     = 1.0f;
-    o.diffuse_mul     = 1.0f;
+    o.diffuse_brdf     = 0.0f;
+    o.indirect_diffuse = 1.0f;
+    o.direct_diffuse_raw = 0.0f;
+    o.direct_diffuse   = 0.0f;
+    o.diffuse_mul      = 1.0f;
+
+    o.diffuse_amb      = o.indirect_diffuse;
+    o.diffuse_dir_raw  = o.direct_diffuse_raw;
+    o.diffuse_dir      = o.direct_diffuse;
 #endif
 
     #if LIGHT_USE_PHONG
@@ -794,17 +817,17 @@ o.intensity = Li;
         spec_dir_gated *= lambert;
     #endif
 
-    o.spec_pow      = spec_pow;
-    o.spec_dir_raw   = spec_dir_raw;
-    o.spec_dir_gated = spec_dir_gated;
-    o.spec_base      = spec_dir_gated; //  old compatibility
-    o.spec_add       = o.kspec * spec_dir_gated;
+    o.spec_pow        = spec_pow;
+    o.spec_dir_raw    = spec_dir_raw;
+    o.spec_dir_gated  = spec_dir_gated;
+    o.spec_base       = spec_dir_gated;
+    o.spec_add        = o.kspec * spec_dir_gated;
 #else
-    o.spec_pow      = 0.0f;
-    o.spec_dir_raw   = 0.0f;
-    o.spec_dir_gated = 0.0f;
-    o.spec_base      = 0.0f;
-    o.spec_add       = 0.0f;
+    o.spec_pow        = 0.0f;
+    o.spec_dir_raw    = 0.0f;
+    o.spec_dir_gated  = 0.0f;
+    o.spec_base       = 0.0f;
+    o.spec_add        = 0.0f;
 #endif
 
 #endif

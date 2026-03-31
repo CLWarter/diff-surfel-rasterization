@@ -426,7 +426,7 @@ renderCUDA(
 
 				// Shaded color is: shaded = diffuse_mul * base_color + spec_add (RGB only)
 				// Gradient into base color multiplied by diffuse_mul
-				const float dchannel_dcolor = w * Lout.diffuse_mul;
+				const float dchannel_dcolor = w * (Lout.indirect_diffuse + Lout.direct_diffuse);
 
 				// Accumulators for lighting parameter gradients
 				float dL_ddiffuse = 0.0f; // accum over channels
@@ -450,7 +450,7 @@ renderCUDA(
 					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 					last_color[ch] = c;
 
-					float eff = (Lout.diffuse_amb + Lout.diffuse_dir) * c;
+					float eff = (Lout.indirect_diffuse + Lout.direct_diffuse) * c;
 					#if LIGHT_USE_PHONG
 						if (ch < 3) eff += Lout.spec_add;
 					#endif
@@ -476,7 +476,7 @@ renderCUDA(
 				float dDiff_dLi = 0.0f;
 				#if LIGHT_USE_LAMBERT
 					// only directional diffuse depends on Li
-					dDiff_dLi = Lout.lambert * Lout.spot;
+					dDiff_dLi = Lout.diffuse_brdf * Lout.lambert * Lout.spot;
 
 					#if LIGHT_ENERGY_COMP
 						dDiff_dLi *= (1.0f - Lout.kspec);
@@ -728,7 +728,7 @@ renderCUDA(
 				float dL_dndotl = 0.0f;
 				#if LIGHT_USE_LAMBERT
 				{
-					float dL_dlambert = dL_ddiffuse * Lout.spot * Lout.intensity;
+					float dL_dlambert = dL_ddiffuse * Lout.diffuse_brdf * Lout.spot * Lout.intensity;
 					#if LIGHT_ENERGY_COMP
 						dL_dlambert *= (1.0f - Lout.kspec);
 					#endif
