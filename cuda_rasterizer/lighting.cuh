@@ -32,7 +32,7 @@ struct LightingOut {
 
     // ambient/intensity
     float ambient;
-    float intensity;         // Li = I * inv * shade_conf (after clamp if used)
+    float intensity;         // Li = I * inv 
     float inv;
     float dintensity_ddepth;
     float Li;        // final intensity
@@ -46,8 +46,6 @@ struct LightingOut {
     float dkspecular;
     float shiny;
     float dshin_raw;
-
-    float shade_conf;
 };
 
 __device__ __forceinline__ float3 apply_norm_jacobian(float3 n_raw, float3 g_unit)
@@ -90,12 +88,9 @@ float3 compute_light_dir(const float2& pixf,
                            depth_cam * ray.y,
                            depth_cam);
 
-    // --- light position: 1cm left + up (diagonal) ---
-    const float comp = 0.01f * 0.70710678f;  // 1cm / sqrt(2)
-
     const float3 light_pos = make_float3(
-        -comp,   // left (negative x)
-        -comp,   // up   (negative y in your pixel convention)
+         0.0f,   // left (negative x)
+         0.0f,   // up   (negative y in your pixel convention)
          0.0f
     );
 
@@ -282,8 +277,7 @@ float3 pointcam_lighting_grad_approx(
     float dL_ddiffuse,
     float dL_dspec)
 {
-    const float comp = 0.01f * 0.70710678f;
-    const float3 light_pos = make_float3(-comp, -comp, 0.0f);
+    const float3 light_pos = make_float3(0.0f, 0.0f, 0.0f);
 
     float3 P = point_cam;
 
@@ -503,7 +497,7 @@ float3 pointcam_lighting_grad_approx(
         float inv = 1.0f / (1.0f + k * dist2);
         float dInv_dDist2 = -k * inv * inv;
 
-        float dLi_dDist2 = Lout.I * Lout.shade_conf * dInv_dDist2;
+        float dLi_dDist2 = Lout.I * dInv_dDist2;
 
         #if (LIGHT_LI_CLAMP > 0)
             if (Lout.li_clamped > 0.5f)
@@ -532,9 +526,7 @@ LightingOut eval_lighting(
     const float* __restrict__ intensity,
     const float* __restrict__ kspecs,
     const float* __restrict__ shiny,
-    const float3* point_cam_opt = nullptr,
-    float surface_conf = 1.0f,
-    float alpha_local = 1.0f
+    const float3* point_cam_opt = nullptr
 ) {
     LightingOut o = {};
     o.diffuse_mul        = 1.0f;
@@ -577,8 +569,6 @@ LightingOut eval_lighting(
     o.shiny              = LIGHT_PHONG_SHININESS;
     o.dshin_raw          = 0.0f;
 
-    o.shade_conf         = 1.0f;
-
 #if (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
     float3 n = normalize_or_default(n_raw, make_float3(0.f, 0.f, 1.f));
 
@@ -612,8 +602,7 @@ LightingOut eval_lighting(
         // ------------------------------------------------------------
     // Light position in camera space
     // ------------------------------------------------------------
-    const float comp = 0.01f * 0.70710678f;
-    const float3 light_pos = make_float3(-comp, -comp, 0.0f);
+    const float3 light_pos = make_float3(0.0f, 0.0f, 0.0f);
 
     // surface -> light
     float3 L = make_float3(light_pos.x - P.x,
@@ -624,30 +613,6 @@ LightingOut eval_lighting(
     // surface -> camera
     float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
     V = normalize_or_default(V, make_float3(0.f, 0.f, -1.f));
-
-    // Stabilization
-    float nv_raw = fmaxf(-(n.x * view_ray.x + n.y * view_ray.y + n.z * view_ray.z), 0.0f);
-
-    float t = (nv_raw - LIGHT_NORMAL_GRAZING_END) /
-              (LIGHT_NORMAL_GRAZING_START - LIGHT_NORMAL_GRAZING_END);
-    t = fmaxf(0.0f, fminf(t, 1.0f));
-    float grazing_t = 1.0f - smoothstep01(t);
-
-    // extra stabilization for weak contributors
-    float alpha_weak = 1.0f - saturate01(alpha_local / LIGHT_ALPHA_SOFT_REF);
-    float alpha_boost = alpha_weak * LIGHT_NORMAL_ALPHA_BOOST;
-
-    float3 n_view = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
-    float blend_w = LIGHT_NORMAL_VIEW_BLEND * grazing_t + alpha_boost;
-    blend_w = saturate01(blend_w);
-
-    float3 n_stable = make_float3(
-        (1.0f - blend_w) * n.x + blend_w * n_view.x,
-        (1.0f - blend_w) * n.y + blend_w * n_view.y,
-        (1.0f - blend_w) * n.z + blend_w * n_view.z
-    );
-
-    n = normalize_or_default(n_stable, make_float3(0.f, 0.f, 1.f)); 
 
     float ndotv = n.x * V.x + n.y * V.y + n.z * V.z;
     o.ndotv = ndotv;
@@ -723,10 +688,7 @@ LightingOut eval_lighting(
 
     o.Li_raw = I * inv;
 
-float alpha_conf = saturate01(alpha_local / LIGHT_ALPHA_SOFT_REF);
-float shade_conf = surface_conf * ((1.0f - LIGHT_WEAK_SHADE_REDUCTION) + LIGHT_WEAK_SHADE_REDUCTION * alpha_conf);
-
-float Li = o.Li_raw * shade_conf;
+float Li = o.Li_raw;
 
 #if (LIGHT_LI_CLAMP > 0)
     if (Li > (float)LIGHT_LI_CLAMP) {
@@ -735,7 +697,6 @@ float Li = o.Li_raw * shade_conf;
     }
 #endif
 
-o.shade_conf = shade_conf;
 o.Li = Li;
 o.intensity = Li;
 

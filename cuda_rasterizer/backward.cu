@@ -326,49 +326,11 @@ renderCUDA(
 			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
 			float rho = min(rho3d, rho2d);
 
-			bool reliable_hit = (rho3d <= rho2d);
-
-			// clamp local hit coordinates
-			const float uv_clamp = LIGHT_HIT_UV_CLAMP;
-			float sx = fmaxf(-uv_clamp, fminf(s.x, uv_clamp));
-			float sy = fmaxf(-uv_clamp, fminf(s.y, uv_clamp));
-
-			bool hit_was_clamped = (fabsf(s.x - sx) > 1e-6f) || (fabsf(s.y - sy) > 1e-6f);
-
-			float3 hit_cam = make_float3(
-				center_cam.x + sx * bu_cam.x + sy * bv_cam.x,
-				center_cam.y + sx * bu_cam.y + sy * bv_cam.y,
-				center_cam.z + sx * bu_cam.z + sy * bv_cam.z
+			float3 point_cam = make_float3(
+				center_cam.x + s.x * bu_cam.x + s.y * bv_cam.x,
+				center_cam.y + s.x * bu_cam.y + s.y * bv_cam.y,
+				center_cam.z + s.x * bu_cam.z + s.y * bv_cam.z
 			);
-
-			// sanity check on hit displacement
-			float3 delta_hit = make_float3(
-				hit_cam.x - center_cam.x,
-				hit_cam.y - center_cam.y,
-				hit_cam.z - center_cam.z
-			);
-
-			float delta2 = delta_hit.x * delta_hit.x +
-						delta_hit.y * delta_hit.y +
-						delta_hit.z * delta_hit.z;
-
-			const float hit_delta2_max = LIGHT_HIT_DELTA2_MAX;
-			bool sane_hit = (delta2 <= hit_delta2_max);
-
-			float3 point_cam = (reliable_hit && sane_hit) ? hit_cam : center_cam;
-
-			float surface_conf = 1.0f;
-
-			if (!reliable_hit || !sane_hit)
-				surface_conf *= LIGHT_CONF_FALLBACK;
-
-			if (hit_was_clamped)
-				surface_conf *= LIGHT_CONF_CLAMPED_HIT;
-
-			float point_disp = sqrtf(fmaxf(delta2, 1e-12f));
-			float disp_conf = 1.0f / (1.0f + LIGHT_CONF_DISP_K * point_disp);
-			surface_conf *= disp_conf;
-			surface_conf = fmaxf(0.05f, fminf(surface_conf, 1.0f));
 
 			// compute depth
 			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]
@@ -387,14 +349,9 @@ renderCUDA(
 				continue;
 
 			const float G = exp(power);
-			float alpha = min(0.99f, opa * exp(power));
-			if (alpha < LIGHT_ALPHA_SKIP_THRESHOLD)
+			const float alpha = min(0.99f, opa * G);
+			if (alpha < 1.0f / 255.0f)
 				continue;
-
-			if (alpha < LIGHT_ALPHA_SOFT_REF)
-				surface_conf *= LIGHT_CONF_LOW_ALPHA;
-
-			surface_conf = fmaxf(0.05f, fminf(surface_conf, 1.0f));
 
 			T = T / (1.f - alpha);
 
@@ -420,7 +377,7 @@ renderCUDA(
 				const float* shi_ptr = shiny + global_id;
 
 				// Pass pointers of learned factors, pixel pos, normal, cam params
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr, &point_cam, surface_conf, alpha);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
 
 				const float w = alpha * T;
 
@@ -498,107 +455,6 @@ renderCUDA(
 
 				float dL_dLi = dL_ddiffuse * dDiff_dLi + dL_dspec * dSpec_dLi;
 
-				// ---- smooth surface_conf path via disp_conf(point_disp) ----
-				{
-					// Only meaningful when using hit_cam
-					if (reliable_hit && sane_hit && !hit_was_clamped)
-					{
-						// Reconstruct the detached multiplicative prefactor of surface_conf
-						float surface_prefac = 1.0f;
-
-						// reliable/sane branch is required here, so no fallback factor
-						// hit_was_clamped is excluded above, so no clamped-hit factor
-
-						if (alpha < LIGHT_ALPHA_SOFT_REF)
-							surface_prefac *= LIGHT_CONF_LOW_ALPHA;
-
-						// disp_conf = 1 / (1 + k * point_disp)
-						const float k_disp = LIGHT_CONF_DISP_K;
-						const float disp = point_disp;
-						const float denom = 1.0f + k_disp * disp;
-						const float disp_conf_local = 1.0f / denom;
-
-						// surface_conf before final clamp
-						float surface_conf_unc = surface_prefac * disp_conf_local;
-
-						// hard clamp in forward -> zero derivative when clamp is active
-						float dsurfaceconf_ddisp = 0.0f;
-						if (surface_conf_unc > 0.05f && surface_conf_unc < 1.0f)
-						{
-							dsurfaceconf_ddisp = surface_prefac * (-k_disp) / (denom * denom);
-						}
-
-						// Li = Li_raw * shade_conf
-						// shade_conf = surface_conf * shade_base
-						// so dLi/dsurface_conf = Li / surface_conf  (unclamped Li case)
-						float dLi_dsurfaceconf = 0.0f;
-						float shade_base = Lout.shade_conf / fmaxf(surface_conf, 1e-8f);
-
-						#if (LIGHT_LI_CLAMP > 0)
-							if (Lout.li_clamped <= 0.5f && surface_conf > 1e-8f)
-								dLi_dsurfaceconf = Lout.Li_raw * shade_base;
-						#else
-							if (surface_conf > 1e-8f)
-								dLi_dsurfaceconf = Lout.Li_raw * shade_base;
-						#endif
-
-						float dL_ddisp = dL_dLi * dLi_dsurfaceconf * dsurfaceconf_ddisp;
-
-						// point_disp = ||delta_hit||
-						if (disp > 1e-8f)
-						{
-							float inv_disp = 1.0f / disp;
-							float3 g_hit_disp = make_float3(
-								dL_ddisp * delta_hit.x * inv_disp,
-								dL_ddisp * delta_hit.y * inv_disp,
-								dL_ddisp * delta_hit.z * inv_disp
-							);
-
-							extra_dL_dsx += g_hit_disp.x * bu_cam.x +
-											g_hit_disp.y * bu_cam.y +
-											g_hit_disp.z * bu_cam.z;
-
-							extra_dL_dsy += g_hit_disp.x * bv_cam.x +
-											g_hit_disp.y * bv_cam.y +
-											g_hit_disp.z * bv_cam.z;
-						}
-					}
-				}
-
-				// ---- alpha_local -> shade_conf -> Li contribution ----
-				{
-					float dshadeconf_dalpha = 0.0f;
-
-					// alpha_conf = saturate(alpha / LIGHT_ALPHA_SOFT_REF)
-					if (alpha > 0.0f && alpha < LIGHT_ALPHA_SOFT_REF)
-					{
-						dshadeconf_dalpha =
-							surface_conf *
-							LIGHT_WEAK_SHADE_REDUCTION *
-							(1.0f / LIGHT_ALPHA_SOFT_REF);
-					}
-
-					// Li = Li_raw * shade_conf, Li_raw = I * inv
-					float Li_raw_unclamped = 0.0f;
-				#if (LIGHT_LI_CLAMP > 0)
-					if (Lout.li_clamped <= 0.5f)
-						Li_raw_unclamped = Lout.Li_raw;
-					else
-						Li_raw_unclamped = 0.0f; // hard clamp => zero local gradient
-				#else
-					Li_raw_unclamped = Lout.Li_raw;
-				#endif
-
-					float dLi_dalpha_local = Li_raw_unclamped * dshadeconf_dalpha;
-
-				#if (LIGHT_LI_CLAMP > 0)
-					if (Lout.li_clamped > 0.5f)
-						dLi_dalpha_local = 0.0f;
-				#endif
-
-					dL_dalpha += dL_dLi * dLi_dalpha_local;
-				}
-
 				// If forward clamped Li, stop gradients through Li to avoid it fighting the clamp
 				float li_grad_gate = 1.0f;
 
@@ -608,8 +464,8 @@ renderCUDA(
 
 				// ---- intensity learnable (per-scene) gradient ----
 				{
-					// Li = I * inv * shade_conf  => dLi/dI = inv * shade_conf
-					float dL_dI = (dL_dLi * li_grad_gate) * Lout.inv * Lout.shade_conf;
+					// Li = I * inv  => dLi/dI = inv
+					float dL_dI = (dL_dLi * li_grad_gate) * Lout.inv;
 
 					// I = softplus_beta2(clamp(I_raw, -15, 15))
 					// Lout.dI_raw already stores dI/dI_raw including the clamp gate
@@ -622,7 +478,7 @@ renderCUDA(
 				}
 
 			#if FALLOFF_Z_GRAD_ENABLE
-				float contrib = (dL_dLi * li_grad_gate) * Lout.dintensity_ddepth * Lout.shade_conf;
+				float contrib = (dL_dLi * li_grad_gate) * Lout.dintensity_ddepth;
 				contrib *= FALLOFF_Z_GRAD_SCALE;
 				contrib = fminf(fmaxf(contrib, -FALLOFF_Z_GRAD_CLAMP), FALLOFF_Z_GRAD_CLAMP);
 				dL_dz += contrib;
@@ -680,33 +536,11 @@ renderCUDA(
 			if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f)
 			{
 				// Unit normal used in forward
-				float3 n_pre = normalize_or_default(n_raw, make_float3(0.f,0.f,1.f));
 				float3 view_ray = normalize_or_default(point_cam, make_float3(0.f, 0.f, 1.f));
 
-				float nv_raw = fmaxf(-(n_pre.x * view_ray.x + n_pre.y * view_ray.y + n_pre.z * view_ray.z), 0.0f);
+				float3 n = normalize_or_default(n_raw, make_float3(0.f, 0.f, 1.f));
 
-				float t = (nv_raw - LIGHT_NORMAL_GRAZING_END) /
-						(LIGHT_NORMAL_GRAZING_START - LIGHT_NORMAL_GRAZING_END);
-				t = fmaxf(0.0f, fminf(t, 1.0f));
-				float grazing_t = 1.0f - smoothstep01(t);
-
-				float alpha_weak = 1.0f - saturate01(alpha / LIGHT_ALPHA_SOFT_REF);
-				float alpha_boost = alpha_weak * LIGHT_NORMAL_ALPHA_BOOST;
-
-				float3 n_view = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
-				float blend_w = LIGHT_NORMAL_VIEW_BLEND * grazing_t + alpha_boost;
-				blend_w = saturate01(blend_w);
-
-				float3 n_stable = make_float3(
-					(1.0f - blend_w) * n_pre.x + blend_w * n_view.x,
-					(1.0f - blend_w) * n_pre.y + blend_w * n_view.y,
-					(1.0f - blend_w) * n_pre.z + blend_w * n_view.z
-				);
-
-				float3 n_unit = normalize_or_default(n_stable, make_float3(0.f,0.f,1.f));
-
-				const float comp = 0.01f * 0.70710678f;
-				const float3 light_pos = make_float3(-comp, -comp, 0.0f);
+				const float3 light_pos = make_float3(0.0f, 0.0f, 0.0f);
 
 				float3 Lvec = make_float3(light_pos.x - point_cam.x,
 										  light_pos.y - point_cam.y,
@@ -771,14 +605,13 @@ renderCUDA(
 				#if LIGHT_USE_PHONG
 				{
 					const float NDOTH_MAX = 0.95f;
-					const float ndoth = Lout.ndoth; // forward-used clamped value
-					const float ndoth_raw = n_unit.x * Hh.x + n_unit.y * Hh.y + n_unit.z * Hh.z;
+					const float ndoth = Lout.ndoth;
+					const float ndoth_raw = n.x * Hh.x + n.y * Hh.y + n.z * Hh.z;
 
 					if (dL_dspec != 0.0f)
 					{
 						float dL_dndoth = 0.0f;
 
-						// derivative wrt ndoth_raw only exists in unclamped interval
 						if (ndoth_raw > 0.0f && ndoth_raw < NDOTH_MAX)
 						{
 							float spec_deriv = 0.0f;
@@ -800,7 +633,6 @@ renderCUDA(
 							dL_dndoth = dL_dspec * dspec_dndoth;
 						}
 
-						// accumulate into unit-normal gradient
 						if (dL_dndoth != 0.0f)
 						{
 							g_unit.x += dL_dndoth * Hh.x;
@@ -811,98 +643,37 @@ renderCUDA(
 				}
 				#endif
 
-				// Map gradient back to raw normal space through normalization Jacobian
-				// back through final normalize(n_stable)
-				float3 g_nstable = apply_norm_jacobian(n_stable, g_unit);
+				// back through normalize(n_raw) -> n
+				float3 g_raw = apply_norm_jacobian(n_raw, g_unit);
 
-				float raw_blend = LIGHT_NORMAL_VIEW_BLEND * grazing_t + alpha_boost;
-
-				// from n_stable = (1-blend_w)*n_pre + blend_w*n_view
-				// dL/d(blend_w) = dot(g_nstable, n_view - n_pre)
-				float g_blend =
-					g_nstable.x * (n_view.x - n_pre.x) +
-					g_nstable.y * (n_view.y - n_pre.y) +
-					g_nstable.z * (n_view.z - n_pre.z);
-
-				// saturate gate: derivative only in open interval (0,1)
-				float g_raw_blend = 0.0f;
-				if (raw_blend > 0.0f && raw_blend < 1.0f)
-					g_raw_blend = g_blend;
-
-				// alpha_boost = alpha_weak * LIGHT_NORMAL_ALPHA_BOOST
-				// alpha_weak = 1 - saturate01(alpha / LIGHT_ALPHA_SOFT_REF)
-				// so for 0 < alpha < LIGHT_ALPHA_SOFT_REF:
-				// d(alpha_boost)/d(alpha) = -LIGHT_NORMAL_ALPHA_BOOST / LIGHT_ALPHA_SOFT_REF
-				if (alpha > 0.0f && alpha < LIGHT_ALPHA_SOFT_REF)
-				{
-					float dalphaboost_dalpha = -LIGHT_NORMAL_ALPHA_BOOST / LIGHT_ALPHA_SOFT_REF;
-					dL_dalpha += g_raw_blend * dalphaboost_dalpha;
-				}
-
-				// back through affine blend, treating blend_w as constant
-				float3 g_npre = make_float3(
-					(1.0f - blend_w) * g_nstable.x,
-					(1.0f - blend_w) * g_nstable.y,
-					(1.0f - blend_w) * g_nstable.z
-				);
-
-				// optional: send some gradient to point_cam through n_view part
-				float3 g_nview = make_float3(
-					blend_w * g_nstable.x,
-					blend_w * g_nstable.y,
-					blend_w * g_nstable.z
-				);
-
-				// n_view = -view_ray = -normalize(point_cam)
-				float3 g_viewray = make_float3(-g_nview.x, -g_nview.y, -g_nview.z);
-				float3 g_point_from_nview = apply_norm_jacobian(point_cam, g_viewray);
-
-				// back through first normalize(n_raw)
-				float3 g_raw = apply_norm_jacobian(n_raw, g_npre);
-
-				// add point-cam contribution only if you want this approximation
-				// currently no clean buffer to store it, so keep for later or debugging
-
-				const float gmax = 5.0f;  // safety clamp, to prevent rare spikes
+				const float gmax = 5.0f;
 				g_raw.x = fminf(fmaxf(g_raw.x, -gmax), gmax);
 				g_raw.y = fminf(fmaxf(g_raw.y, -gmax), gmax);
 				g_raw.z = fminf(fmaxf(g_raw.z, -gmax), gmax);
 
-				// Write raw normal gradient
 				atomicAdd(&dL_dnormal3D[global_id * 3 + 0], g_raw.x);
 				atomicAdd(&dL_dnormal3D[global_id * 3 + 1], g_raw.y);
 				atomicAdd(&dL_dnormal3D[global_id * 3 + 2], g_raw.z);
 
 				// ---------- point_cam lighting gradient approximation ----------
 				{
-					float3 n_unit_for_geom = n_unit;
+					float3 n_for_geom = n;
 
 					float3 g_point_light = pointcam_lighting_grad_approx(
 						Lout,
 						point_cam,
-						n_unit_for_geom,
+						n_for_geom,
 						dL_ddiffuse,
 						dL_dspec
 					);
 
-					float3 g_point_total = make_float3(
-						g_point_light.x + g_point_from_nview.x,
-						g_point_light.y + g_point_from_nview.y,
-						g_point_light.z + g_point_from_nview.z
-					);
+					extra_dL_dsx += g_point_light.x * bu_cam.x +
+									g_point_light.y * bu_cam.y +
+									g_point_light.z * bu_cam.z;
 
-					// Only push into hit-parameter path when point_cam really came from hit_cam
-					// and the local hit coordinates were not clamped.
-					if (reliable_hit && sane_hit && !hit_was_clamped)
-					{
-						extra_dL_dsx += g_point_total.x * bu_cam.x +
-										g_point_total.y * bu_cam.y +
-										g_point_total.z * bu_cam.z;
-
-						extra_dL_dsy += g_point_total.x * bv_cam.x +
-										g_point_total.y * bv_cam.y +
-										g_point_total.z * bv_cam.z;
-					}
+					extra_dL_dsy += g_point_light.x * bv_cam.x +
+									g_point_light.y * bv_cam.y +
+									g_point_light.z * bv_cam.z;
 				}
 			}
 
@@ -1029,12 +800,8 @@ renderCUDA(
 				const float dG_ddelx = -G * FilterInvSquare * d.x;
 				const float dG_ddely = -G * FilterInvSquare * d.y;
 
-				float spatial_clamp = 10.0f; // Adjust based on scene scale
-				float clamped_sx = fmaxf(-spatial_clamp, fminf(spatial_clamp, extra_dL_dsx));
-    			float clamped_sy = fmaxf(-spatial_clamp, fminf(spatial_clamp, extra_dL_dsy));
-
-				atomicAdd(&dL_dmean2D[global_id].x, (dL_dG * dG_ddelx) + clamped_sx);	// Update X
-				atomicAdd(&dL_dmean2D[global_id].y, (dL_dG * dG_ddely) + clamped_sy);   // Update Y
+				atomicAdd(&dL_dmean2D[global_id].x, (dL_dG * dG_ddelx));	// Update X
+				atomicAdd(&dL_dmean2D[global_id].y, (dL_dG * dG_ddely));   // Update Y
 
 				// Propagate the gradients of depth
 				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  s.x * dL_dz);

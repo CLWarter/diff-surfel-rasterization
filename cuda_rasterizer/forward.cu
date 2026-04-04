@@ -422,62 +422,11 @@ renderCUDA(
 			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
 			float rho = min(rho3d, rho2d);
 
-			bool reliable_hit = (rho3d <= rho2d);
-
-			// clamp local hit coordinates
-			const float uv_clamp = LIGHT_HIT_UV_CLAMP;
-			float sx = fmaxf(-uv_clamp, fminf(s.x, uv_clamp));
-			float sy = fmaxf(-uv_clamp, fminf(s.y, uv_clamp));
-
-			bool hit_was_clamped = (fabsf(s.x - sx) > 1e-6f) || (fabsf(s.y - sy) > 1e-6f);
-
-			float3 hit_cam = make_float3(
-				center_cam.x + sx * bu_cam.x + sy * bv_cam.x,
-				center_cam.y + sx * bu_cam.y + sy * bv_cam.y,
-				center_cam.z + sx * bu_cam.z + sy * bv_cam.z
+			float3 point_cam = make_float3(
+				center_cam.x + s.x * bu_cam.x + s.y * bv_cam.x,
+				center_cam.y + s.x * bu_cam.y + s.y * bv_cam.y,
+				center_cam.z + s.x * bu_cam.z + s.y * bv_cam.z
 			);
-
-			// sanity check on hit displacement
-			float3 delta_hit = make_float3(
-				hit_cam.x - center_cam.x,
-				hit_cam.y - center_cam.y,
-				hit_cam.z - center_cam.z
-			);
-
-			float delta2 = delta_hit.x * delta_hit.x +
-						delta_hit.y * delta_hit.y +
-						delta_hit.z * delta_hit.z;
-
-			const float hit_delta2_max = LIGHT_HIT_DELTA2_MAX;
-			bool sane_hit = (delta2 <= hit_delta2_max);
-
-			float3 point_cam = (reliable_hit && sane_hit) ? hit_cam : center_cam;
-
-			float surface_conf = 1.0f;
-
-			if (!reliable_hit || !sane_hit)
-				surface_conf *= LIGHT_CONF_FALLBACK;
-
-			if (hit_was_clamped)
-				surface_conf *= LIGHT_CONF_CLAMPED_HIT;
-				
-			float point_disp = sqrtf(fmaxf(delta2, 1e-12f));
-			float disp_conf = 1.0f / (1.0f + LIGHT_CONF_DISP_K * point_disp);
-			surface_conf *= disp_conf;
-			surface_conf = fmaxf(0.05f, fminf(surface_conf, 1.0f));
-
-			float3 LP_dbg = make_float3(
-				point_cam.x - (-0.01f * 0.70710678f),
-				point_cam.y - (-0.01f * 0.70710678f),
-				point_cam.z - 0.0f
-			);
-
-			float dist2_dbg = LP_dbg.x * LP_dbg.x + LP_dbg.y * LP_dbg.y + LP_dbg.z * LP_dbg.z;
-			float dist_dbg = sqrtf(fmaxf(dist2_dbg, 1e-12f));
-
-			float disp_x = point_cam.x - center_cam.x;
-			float disp_y = point_cam.y - center_cam.y;
-			float disp_z = point_cam.z - center_cam.z;
 
 			// compute depth
 			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
@@ -497,15 +446,10 @@ renderCUDA(
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, opa * exp(power));
-			if (alpha < LIGHT_ALPHA_SKIP_THRESHOLD)
+			const float G = exp(power);
+			const float alpha = min(0.99f, opa * G);
+			if (alpha < 1.0f / 255.0f)
 				continue;
-
-			// weak contributors should shape shading less
-			if (alpha < LIGHT_ALPHA_SOFT_REF)
-				surface_conf *= LIGHT_CONF_LOW_ALPHA;
-
-			surface_conf = fmaxf(0.05f, fminf(surface_conf, 1.0f));
 
 			float test_T = T * (1 - alpha);
 
@@ -516,23 +460,35 @@ renderCUDA(
 			}
 
 			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
-			float w      = alpha * T;
-			float w_diff = w;        // default, no lighting
-			float w_spec = 0.0f;     // default, no spec
+			float w = alpha * T;
+
+			float w_indirect = 0.0f;
+			float w_direct   = w;    // compatibility if lighting disabled
+			float w_spec     = 0.0f;
 
 			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+			{
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
 				const int gid = collected_id[j];
 				const float* ks_ptr = kspecular + gid;   // per-gaussian
 				const float* shi_ptr = shiny + gid;
 
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam, surface_conf, alpha);
+				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
 
-				w_diff = w * Lout.diffuse_mul;
+				w_indirect = w * Lout.indirect_diffuse;
+				w_direct   = w * Lout.direct_diffuse;
 
 				#if LIGHT_USE_PHONG
 					w_spec = w * Lout.spec_add;
 				#endif
+				}
+				#else
+				{
+					// original no-lighting behavior
+					w_indirect = 0.0f;
+					w_direct   = w;
+					w_spec     = 0.0f;
+				}
 			#endif
 
 #if RENDER_AXUTILITY
@@ -558,6 +514,18 @@ renderCUDA(
 			{
 				float dbg = 0.0f;
 
+				// useful geometric helpers for debug visualization
+				const float dx_pc = point_cam.x - center_cam.x;
+				const float dy_pc = point_cam.y - center_cam.y;
+				const float dz_pc = point_cam.z - center_cam.z;
+				const float point_disp = sqrtf(dx_pc * dx_pc + dy_pc * dy_pc + dz_pc * dz_pc);
+
+				const float3 light_pos_dbg = make_float3(0.0f, 0.0f, 0.0f);
+				const float lx_dbg = point_cam.x - light_pos_dbg.x;
+				const float ly_dbg = point_cam.y - light_pos_dbg.y;
+				const float lz_dbg = point_cam.z - light_pos_dbg.z;
+				const float dist_dbg = sqrtf(lx_dbg * lx_dbg + ly_dbg * ly_dbg + lz_dbg * lz_dbg);
+
 				#if (LIGHT_DEBUG_MODE == 1)
 					// distance from chosen lighting point to light
 					dbg = 1.0f / (1.0f + dist_dbg);
@@ -567,21 +535,12 @@ renderCUDA(
 					dbg = Lout.inv / (1.0f + Lout.inv);
 
 				#elif (LIGHT_DEBUG_MODE == 3)
-					// final lighting intensity after I * inv * confidence and clamp
+					// final lighting intensity after I * inv
 					dbg = Lout.intensity / (1.0f + Lout.intensity);
 
 				#elif (LIGHT_DEBUG_MODE == 4)
 					// spotlight factor
 					dbg = Lout.spot * LIGHT_DEBUG_SCALE;
-
-				#elif (LIGHT_DEBUG_MODE == 5)
-					// hit-state mask:
-					// red = fallback
-					// green = reliable+sane
-					// blue = clamped
-					C[0] = (!reliable_hit || !sane_hit) ? 1.0f : 0.0f;
-					C[1] = (reliable_hit && sane_hit) ? 1.0f : 0.0f;
-					C[2] = hit_was_clamped ? 1.0f : 0.0f;
 
 				#elif (LIGHT_DEBUG_MODE == 6)
 					// displacement of point_cam from center_cam
@@ -598,7 +557,7 @@ renderCUDA(
 					dbg = Lout.ambient * LIGHT_DEBUG_SCALE;
 
 				#elif (LIGHT_DEBUG_MODE == 9)
-					// learned intensity value as seen by eval_lighting
+					// learned intensity value
 					{
 						float dI_dummy = 0.0f;
 						float I_dbg = intensity_value(intensity, &dI_dummy);
@@ -660,7 +619,13 @@ renderCUDA(
 			#pragma unroll
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++) {
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * w_diff;
+				const float albedo = features[collected_id[j] * CHANNELS + ch];
+
+				// indirect / ambient approximation
+				C[ch] += albedo * w_indirect;
+
+				// direct Lambertian BRDF term
+				C[ch] += albedo * w_direct;
 			}
 
 			// Specular added to RGB
