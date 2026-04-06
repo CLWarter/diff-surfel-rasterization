@@ -63,11 +63,6 @@ struct LightingOut {
     float intensity;         // Li = I * inv 
     float dintensity_ddepth;
 
-    // legacy compatibility fields; BRDF path no longer uses them
-    float kspec;
-    float droughness;
-    float dshin_raw;
-
     float3 F0_rgb;
     float3 fresnel_rgb;
 };
@@ -737,8 +732,6 @@ LightingOut eval_lighting(
     o.I                  = 0.0f;
 
     o.dI_raw             = 0.0f;
-    o.kspec              = 0.0f;
-    o.dshin_raw          = 0.0f;
 
     o.metallic           = LIGHT_GGX_METALLIC;
     o.dmetal_raw         = 0.0f;
@@ -895,11 +888,7 @@ o.intensity = Li;
     float dmetal_draw = 0.0f;
     float metallic = metallic_value(metallic_raw, &dmetal_draw);
 
-    // legacy fields are kept zeroed only for temporary compatibility
-    o.kspec = 0.0f;
-    o.droughness = 0.0f;
     o.metallic = 0.0f;
-    o.dshin_raw = 0.0f;
 
     o.metallic = metallic;
     o.dmetal_raw = dmetal_draw;

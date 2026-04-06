@@ -537,7 +537,7 @@ renderCUDA(
 			}
 			#endif
 
-			// ---------- Roughness gradient (bridge: D-term only) ----------
+			// ---------- Roughness gradient (bridge: D-term + G-term) ----------
 			#if LIGHT_USE_PHONG
 			{
 				if (dL_dspec != 0.0f && Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
@@ -562,10 +562,39 @@ renderCUDA(
 						* dD_da2 * Lout.spot * Lout.Li;
 
 					// alpha2 = roughness^4  => d(alpha2)/d(roughness) = 4 r^3
-					const float r = fmaxf(Lout.roughness, 1e-6f);
+					const float r  = fmaxf(Lout.roughness, 1e-6f);
 					const float da2_dr = 4.0f * r * r * r;
+					const float dspec_dr_from_D = dspec_da2 * da2_dr;
 
-					const float dL_dr = dL_dspec * dspec_da2 * da2_dr;
+					// Smith G term derivative wrt roughness
+					auto dG1_dr = [](float nx, float r) -> float
+					{
+						nx = fmaxf(nx, 1e-6f);
+						r  = fmaxf(r,  1e-6f);
+
+						// k = (r + 1)^2 / 8
+						const float k = ((r + 1.0f) * (r + 1.0f)) * 0.125f;
+						const float dk_dr = 0.25f * (r + 1.0f);
+
+						// G1 = nx / (nx * (1-k) + k)
+						const float denom = nx * (1.0f - k) + k;
+						const float ddenom_dr = (1.0f - nx) * dk_dr;
+
+						return -nx * ddenom_dr / (denom * denom);
+					};
+
+					const float dGv_dr = dG1_dr(nv, r);
+					const float dGl_dr = dG1_dr(nl, r);
+					const float dG_dr  = dGv_dr * Lout.Gl + Lout.Gv * dGl_dr;
+
+					const float dspec_dG =
+						(Lout.fresnel * Lout.D / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS))
+						* Lout.spot * Lout.Li;
+
+					const float dspec_dr_from_G = dspec_dG * dG_dr;
+					const float dspec_dr = dspec_dr_from_D + dspec_dr_from_G;
+
+					const float dL_dr = dL_dspec * dspec_dr;
 					const float dL_draw = dL_dr * Lout.drough_raw;
 
 					atomicAdd(&dL_droughness[global_id], dL_draw);
