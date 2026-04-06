@@ -33,8 +33,8 @@ namespace BACKWARD
 		const float* colors,
 		const float* ambients,
 		const float* intensity,
-		const float* kspecular,
-		const float* shiny,
+		const float* roughness,
+		const float* metallic,
 		const float* depths,
 		const float3* means3D_cam,
 		const float3* basis_u_cam,
@@ -50,8 +50,8 @@ namespace BACKWARD
 		float* dL_dcolors,
 		float* dL_dambient,
 		float* dL_dintensity,
-		float* dL_dkspecular,
-		float* dL_dshiny);
+		float* dL_droughness,
+		float* dL_dmetallic);
 
 	void preprocess(
 		int P, int D, int M,

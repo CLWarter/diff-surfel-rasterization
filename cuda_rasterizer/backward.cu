@@ -155,8 +155,8 @@ renderCUDA(
 	const float* __restrict__ colors,
 	const float* __restrict__ ambients,
 	const float* __restrict__ intensity,
-	const float* __restrict__ kspecular,
-	const float* __restrict__ shiny,
+	const float* __restrict__ roughness,
+	const float* __restrict__ metallic,
 	const float* __restrict__ depths,
 	const float3* __restrict__ means3D_cam,
 	const float3* __restrict__ basis_u_cam,
@@ -172,8 +172,8 @@ renderCUDA(
 	float* __restrict__ dL_dcolors,
 	float* __restrict__ dL_dambients,
 	float* __restrict__ dL_dintensity_raw,
-	float* __restrict__ dL_dkspecular,
-	float* __restrict__ dL_dshiny)
+	float* __restrict__ dL_droughness,
+	float* __restrict__ dL_dmetallic)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -366,17 +366,34 @@ renderCUDA(
 			float extra_dL_dsx = 0.0f;
 			float extra_dL_dsy = 0.0f;
 
+			LightingOut Lout = {};
+			const float* rough_ptr = nullptr;
+			const float* metal_ptr = nullptr;
+
 			#if LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 
 				// Evaluate lighting terms matching forward
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
 
 				// per gaussian pointers
-				const float* ks_ptr = kspecular + global_id;
-				const float* shi_ptr = shiny + global_id;
+				const int gid = collected_id[j];
+				rough_ptr = roughness + gid;
+				metal_ptr = metallic + gid;
 
-				// Pass pointers of learned factors, pixel pos, normal, cam params
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, c_d, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
+				float3 base_rgb = make_float3(
+					collected_colors[0 * BLOCK_SIZE + j],
+					collected_colors[1 * BLOCK_SIZE + j],
+					collected_colors[2 * BLOCK_SIZE + j]
+				);
+
+				Lout = eval_lighting(
+					pixf, W, H, focal_x, focal_y,
+					n_raw, c_d,
+					ambients, intensity,
+					rough_ptr, metal_ptr,
+					base_rgb,
+					&point_cam
+				);
 
 				const float w = alpha * T;
 
@@ -408,7 +425,9 @@ renderCUDA(
 
 					float eff = (Lout.indirect_diffuse + Lout.direct_diffuse) * c;
 					#if LIGHT_USE_PHONG
-						if (ch < 3) eff += Lout.spec_add;
+						if (ch == 0) eff += Lout.spec_add_rgb.x;
+						else if (ch == 1) eff += Lout.spec_add_rgb.y;
+						else if (ch == 2) eff += Lout.spec_add_rgb.z;
 					#endif
 
 					accum_eff[ch] = last_alpha * last_eff[ch] + (1.f - last_alpha) * accum_eff[ch];
@@ -420,11 +439,34 @@ renderCUDA(
 					// gradients needed for spec path
 					dL_ddiffuse += dL_dchannel * (w * c);
 					#if LIGHT_USE_PHONG
-						if (ch < 3) dL_dspec += dL_dchannel * w;
+						if (ch < 3) dL_dspec += dL_dchannel * w * (1.0f / 3.0f); // see spec_add = avg(spec_add_rgb)
 					#endif
 
 					// base color gradient
 					atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+
+					#if LIGHT_USE_PHONG
+						if (ch < 3 && Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
+						{
+							// baseColor affects F0 only through metallic workflow
+							const float x = 1.0f - fmaxf(Lout.vdoth, 0.0f);
+							const float x2 = x * x;
+							const float x5 = x2 * x2 * x;
+							const float dF_dF0 = 1.0f - x5;
+
+							const float nv = fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS);
+							const float nl = fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS);
+							const float common = (Lout.D * Lout.G) / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
+
+							// F0_channel = 0.04*(1-m) + baseColor_channel * m
+							const float dF0_dbase = Lout.metallic;
+
+							const float dspec_dbase =
+								dF0_dbase * dF_dF0 * common * Lout.spot * Lout.Li;
+
+							atomicAdd(&(dL_dcolors[global_id * C + ch]), dL_dpixel[ch] * w * dspec_dbase);
+						}
+					#endif
 				}
 
 			// -------- intensity (falloff) to depth gradient --------
@@ -434,19 +476,17 @@ renderCUDA(
 					// only directional diffuse depends on Li
 					dDiff_dLi = Lout.diffuse_brdf * Lout.lambert * Lout.spot;
 
-					#if LIGHT_ENERGY_COMP
-						dDiff_dLi *= (1.0f - Lout.kspec);
-					#endif
+					// New BRDF path:
+					// diffuse attenuation is no longer driven by legacy kspec.
 				#endif
 
 				float dSpec_dLi = 0.0f;
 				#if LIGHT_USE_PHONG
-					float base = Lout.kspec * Lout.spec_pow * Lout.spot;
+					// scalar proxy of RGB GGX spec wrt Li
+					float base = Lout.spec_add / fmaxf(Lout.Li, 1e-6f);
 
 					#if (LIGHT_SPEC_GATING == 1)
 						if (Lout.ndotl <= 0.0f) base = 0.0f;
-					#elif (LIGHT_SPEC_GATING == 2)
-						base *= Lout.lambert;
 					#endif
 
 					dSpec_dLi = base;
@@ -497,22 +537,108 @@ renderCUDA(
 			}
 			#endif
 
-			// ----- kspecular gradient (learned scalar) -----
-			#if LIGHT_USE_PHONG && (LIGHT_PHONG_KS_MODE == 1)
+			// ---------- Roughness gradient (bridge: D-term only) ----------
+			#if LIGHT_USE_PHONG
 			{
-				const float dspecadd_dks = Lout.spec_dir_gated;
+				if (dL_dspec != 0.0f && Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
+				{
+					const float nh = fmaxf(Lout.ndoth, 1e-6f);
+					const float a2 = fmaxf(Lout.alpha2, 1e-8f);
 
-				float ddiffmul_dks = 0.0f;
-				#if LIGHT_ENERGY_COMP && LIGHT_USE_LAMBERT
-					// only directional diffuse depends on ks through energy compensation
-					ddiffmul_dks = -Lout.diffuse_dir_raw;
-				#endif
+					// D = a2 / (pi * t^2 + eps), t = nh^2 (a2 - 1) + 1
+					const float t = nh * nh * (a2 - 1.0f) + 1.0f;
+					const float denom = LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS;
 
-				const float dL_dks = dL_dspec * dspecadd_dks + dL_ddiffuse * ddiffmul_dks;
+					// derivative of D wrt a2
+					const float dD_da2 =
+						(denom - a2 * (2.0f * LIGHT_PI * t * nh * nh)) / (denom * denom);
 
-				atomicAdd(&dL_dkspecular[global_id], dL_dks * Lout.dkspecular);
+					const float nv = fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS);
+					const float nl = fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS);
+
+					// spec scalar proxy = avg(F_rgb) * D * G / (4 nv nl)
+					const float dspec_da2 =
+						(Lout.fresnel * Lout.G / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS))
+						* dD_da2 * Lout.spot * Lout.Li;
+
+					// alpha2 = roughness^4  => d(alpha2)/d(roughness) = 4 r^3
+					const float r = fmaxf(Lout.roughness, 1e-6f);
+					const float da2_dr = 4.0f * r * r * r;
+
+					const float dL_dr = dL_dspec * dspec_da2 * da2_dr;
+					const float dL_draw = dL_dr * Lout.drough_raw;
+
+					atomicAdd(&dL_droughness[global_id], dL_draw);
+				}
 			}
 			#endif
+
+			// ---------- Metallic gradient (bridge: diffuse + F0/spec proxy) ----------
+			#if LIGHT_USE_PHONG
+			{
+				float dL_dm = 0.0f;
+
+				// diffuse path: direct_diffuse = raw * kd, kd ~= avg((1-F)*(1-m))
+				#if LIGHT_USE_LAMBERT
+				{
+					float kd = 1.0f;
+					if (Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
+					{
+						kd = float3_avg(make_float3(
+							(1.0f - Lout.fresnel_rgb.x) * (1.0f - Lout.metallic),
+							(1.0f - Lout.fresnel_rgb.y) * (1.0f - Lout.metallic),
+							(1.0f - Lout.fresnel_rgb.z) * (1.0f - Lout.metallic)
+						));
+					}
+
+					const float dkd_dm = -float3_avg(make_float3(
+						1.0f - Lout.fresnel_rgb.x,
+						1.0f - Lout.fresnel_rgb.y,
+						1.0f - Lout.fresnel_rgb.z
+					));
+
+					const float dDiffuse_dm = Lout.direct_diffuse_raw * dkd_dm;
+					dL_dm += dL_ddiffuse * dDiffuse_dm;
+				}
+				#endif
+
+				// spec path through F0
+				if (dL_dspec != 0.0f && Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
+				{
+					// F0_rgb = 0.04*(1-m) + base_rgb*m  => dF0/dm = base_rgb - 0.04
+					const float3 dF0_dm = make_float3(
+						base_rgb.x - LIGHT_GGX_F0_DIELECTRIC,
+						base_rgb.y - LIGHT_GGX_F0_DIELECTRIC,
+						base_rgb.z - LIGHT_GGX_F0_DIELECTRIC
+					);
+
+					// F = F0 + (1-F0)(1-vh)^5 = F0*(1-k) + k, so dF/dF0 = 1 - (1-vh)^5
+					const float x = 1.0f - fmaxf(Lout.vdoth, 0.0f);
+					const float x2 = x * x;
+					const float x5 = x2 * x2 * x;
+					const float dF_dF0 = 1.0f - x5;
+
+					const float nv = fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS);
+					const float nl = fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS);
+					const float common = (Lout.D * Lout.G) / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
+
+					const float dspec_dm =
+						float3_avg(make_float3(
+							dF0_dm.x * dF_dF0,
+							dF0_dm.y * dF_dF0,
+							dF0_dm.z * dF_dF0
+						)) * common * Lout.spot * Lout.Li;
+
+					dL_dm += dL_dspec * dspec_dm;
+				}
+
+				const float dL_dmraw = dL_dm * Lout.dmetal_raw;
+				atomicAdd(&dL_dmetallic[global_id], dL_dmraw);
+			}
+			#endif
+
+			// Step 2 metallic-roughness bridge:
+			// legacy kspec no longer drives the main BRDF, so disable its gradient here.
 
 			// Step 1 GGX bridge:
 			// no shininess learning anymore; roughness is fixed for now.
@@ -548,9 +674,8 @@ renderCUDA(
 				#if LIGHT_USE_LAMBERT
 				{
 					float dL_dlambert = dL_ddiffuse * Lout.diffuse_brdf * Lout.spot * Lout.intensity;
-					#if LIGHT_ENERGY_COMP
-						dL_dlambert *= (1.0f - Lout.kspec);
-					#endif
+					// New BRDF path:
+					// no legacy kspec attenuation on diffuse lambert term.
 
 					#if LIGHT_LAMBERT_ABS
 						if (Lout.ndotl > 0.0f) dL_dndotl += dL_dlambert;
@@ -565,8 +690,7 @@ renderCUDA(
 				{
 					if (dL_dspec != 0.0f)
 					{
-						// spec_add = ks * spec_pow * spot * Li * lambert
-						float dspec_dlambert = Lout.kspec * Lout.spec_pow * Lout.spot * Lout.intensity;
+						float dspec_dlambert = Lout.spec_dir_raw;
 
 						float dL_dlambert_from_spec = dL_dspec * dspec_dlambert;
 
@@ -629,11 +753,11 @@ renderCUDA(
 						#elif (LIGHT_SPEC_GATING == 2)
 							dspec_dndoth *= Lout.lambert;
 							// plus lambert path contribution
-							dspec_dndotl += (Lout.kspec * Lout.spec_dir_raw);
+							dspec_dndotl += Lout.spec_dir_raw;
 						#endif
 
-						dspec_dndoth *= Lout.kspec;
-						dspec_dndotl *= Lout.kspec;
+						// New BRDF path:
+						// no legacy kspec multiplier on GGX spec derivatives.
 
 						float dL_dndoth = dL_dspec * dspec_dndoth;
 						float dL_dndotl_from_spec = dL_dspec * dspec_dndotl;
@@ -1101,8 +1225,8 @@ void BACKWARD::render(
 	const float* colors,
 	const float* ambients,
 	const float* intensity,
-	const float* kspecular,
-	const float* shiny,
+	const float* roughness,
+	const float* metallic,
 	const float* transMats,
 	const float* depths,
 	const float3* means3D_cam,
@@ -1119,8 +1243,8 @@ void BACKWARD::render(
 	float* dL_dcolors,
 	float* dL_dambient,
 	float* dL_dintensity,
-	float* dL_dkspecular,
-	float* dL_dshiny)
+	float* dL_droughness,
+	float* dL_dmetallic)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -1134,8 +1258,8 @@ void BACKWARD::render(
 		colors,
 		ambients,
 		intensity,
-		kspecular,
-		shiny,
+		roughness,
+		metallic,
 		depths,
 		means3D_cam,
 		basis_u_cam,
@@ -1151,7 +1275,7 @@ void BACKWARD::render(
 		dL_dcolors,
 		dL_dambient,
 		dL_dintensity,
-		dL_dkspecular,
-		dL_dshiny
+		dL_droughness,
+		dL_dmetallic
 		);
 }

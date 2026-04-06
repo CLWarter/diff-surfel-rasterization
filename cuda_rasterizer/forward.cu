@@ -300,8 +300,8 @@ renderCUDA(
 	const float* __restrict__ features,
 	const float* __restrict__ ambients,
 	const float* __restrict__ intensity,
-	const float* __restrict__ kspecular,
-	const float* __restrict__ shiny,
+	const float* __restrict__ roughness,
+	const float* __restrict__ metallic,
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
@@ -458,34 +458,42 @@ renderCUDA(
 
 			float w_indirect = 0.0f;
 			float w_direct   = w;    // compatibility if lighting disabled
-			float w_spec     = 0.0f;
 
             LightingOut Lout = {};
-            const float* ks_ptr = nullptr;
-            const float* shi_ptr = nullptr;
+            const float* rough_ptr = nullptr;
+			const float* metal_ptr = nullptr;
 
 			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 			{
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
 				const int gid = collected_id[j];
-				ks_ptr = kspecular + gid;   // per-gaussian
-				shi_ptr = shiny + gid;
+				rough_ptr = roughness + gid;
+				metal_ptr = metallic + gid;
 
-				Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
+				float3 base_rgb = make_float3(
+                    features[collected_id[j] * CHANNELS + 0],
+					features[collected_id[j] * CHANNELS + 1],
+					features[collected_id[j] * CHANNELS + 2]
+                );
+
+                Lout = eval_lighting(
+                    pixf, W, H, focal_x, focal_y,
+                    n_raw, depth,
+                    ambients, intensity,
+                    rough_ptr, metal_ptr,
+                    base_rgb,
+                    &point_cam
+                );
 
 				w_indirect = w * Lout.indirect_diffuse;
 				w_direct   = w * Lout.direct_diffuse;
 
-				#if LIGHT_USE_PHONG
-					w_spec = w * Lout.spec_add;
-				#endif
 				}
 				#else
 				{
 					// original no-lighting behavior
 					w_indirect = 0.0f;
 					w_direct   = w;
-					w_spec     = 0.0f;
 				}
 			#endif
 
@@ -563,15 +571,19 @@ renderCUDA(
 					}
 
 				#elif (LIGHT_DEBUG_MODE == 10)
-					// learned kspec
-					dbg = kspec_value(ks_ptr) * LIGHT_DEBUG_SCALE;
+					// metallic value / port
+					{
+						float dmetal_dummy = 0.0f;
+						float m_dbg = metallic_value(metal_ptr, &dmetal_dummy);
+						dbg = m_dbg;
+					}
 
 				#elif (LIGHT_DEBUG_MODE == 11)
-					// learned shiny
+					// roughness value / port
 					{
-						float dshin_dummy = 0.0f;
-						float s_dbg = shininess_value(shi_ptr, &dshin_dummy);
-						dbg = logf(1.0f + s_dbg) / logf(1.0f + LIGHT_SHINY_MAX);
+						float drough_dummy = 0.0f;
+						float r_dbg = roughness_value(rough_ptr, &drough_dummy);
+						dbg = r_dbg;
 					}
 
 				#elif (LIGHT_DEBUG_MODE == 12)
@@ -583,7 +595,7 @@ renderCUDA(
 					dbg = Lout.lambert * LIGHT_DEBUG_SCALE;
 
 				#elif (LIGHT_DEBUG_MODE == 14)
-					// specular additive contribution
+					// RGB specular additive contribution shown as scalar proxy
 					dbg = Lout.spec_add / (1.0f + Lout.spec_add);
 
 				#elif (LIGHT_DEBUG_MODE == 15)
@@ -628,14 +640,12 @@ renderCUDA(
 
 				// direct Lambertian BRDF term
 				C[ch] += albedo * w_direct;
+			
+				// Specular added to RGB
+				#if LIGHT_USE_PHONG
+				if (ch < 3) C[ch] += w * ((&Lout.spec_add_rgb.x)[ch]);
+				#endif
 			}
-
-			// Specular added to RGB
-			#if LIGHT_USE_PHONG
-				C[0] += w_spec;
-				C[1] += w_spec;
-				C[2] += w_spec;
-			#endif
 
 			T = test_T;
 
@@ -683,8 +693,8 @@ void FORWARD::render(
 	const float* colors,
 	const float* ambients,
 	const float* intensity,
-	const float* kspecular,
-	const float* shiny,
+	const float* roughness,
+	const float* metallic,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
@@ -706,8 +716,8 @@ void FORWARD::render(
 		colors,
 		ambients,
 		intensity,
-		kspecular,
-		shiny,
+		roughness,
+		metallic,
 		transMats,
 		depths,
 		normal_opacity,

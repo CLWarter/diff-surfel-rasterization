@@ -104,6 +104,22 @@
 #define LIGHT_GGX_F0_DIELECTRIC 0.04f
 #endif
 
+#ifndef LIGHT_GGX_METALLIC_MODE
+#define LIGHT_GGX_METALLIC_MODE 0   // 0 = fixed, 1 = later learnable
+#endif
+
+#ifndef LIGHT_GGX_METALLIC
+#define LIGHT_GGX_METALLIC 0.0f
+#endif
+
+#ifndef LIGHT_GGX_METALLIC_MIN
+#define LIGHT_GGX_METALLIC_MIN 0.0f
+#endif
+
+#ifndef LIGHT_GGX_METALLIC_MAX
+#define LIGHT_GGX_METALLIC_MAX 1.0f
+#endif
+
 #ifndef LIGHT_GGX_NV_EPS
 #define LIGHT_GGX_NV_EPS 1e-4f
 #endif
@@ -212,11 +228,11 @@
 // 7 = learned raw normal
 // 8 = learned ambient
 // 9 = learned intensity parameter/value
-// 10 = learned kspec
-// 11 = learned shiny
+// 10 = metallic value / port
+// 11 = roughness value / port
 // 12 = ndotl
 // 13 = lambert
-// 14 = spec_add
+// 14 = scalar view of RGB spec luminance proxy
 // 15 = point_cam.z
 // 16 = alpha contribution
 // 17 = w contribution
