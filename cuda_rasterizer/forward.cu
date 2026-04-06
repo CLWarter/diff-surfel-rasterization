@@ -453,12 +453,6 @@ renderCUDA(
 
 			float test_T = T * (1 - alpha);
 
-			if (test_T < 0.0001f)
-			{
-				done = true;
-				continue;
-			}
-
 			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
 			float w = alpha * T;
 
@@ -466,14 +460,18 @@ renderCUDA(
 			float w_direct   = w;    // compatibility if lighting disabled
 			float w_spec     = 0.0f;
 
+            LightingOut Lout = {};
+            const float* ks_ptr = nullptr;
+            const float* shi_ptr = nullptr;
+
 			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 			{
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
 				const int gid = collected_id[j];
-				const float* ks_ptr = kspecular + gid;   // per-gaussian
-				const float* shi_ptr = shiny + gid;
+				ks_ptr = kspecular + gid;   // per-gaussian
+				shi_ptr = shiny + gid;
 
-				LightingOut Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
+				Lout = eval_lighting(pixf, W, H, focal_x, focal_y, n_raw, depth, ambients, intensity, ks_ptr, shi_ptr, &point_cam);
 
 				w_indirect = w * Lout.indirect_diffuse;
 				w_direct   = w * Lout.direct_diffuse;
@@ -611,6 +609,10 @@ renderCUDA(
 				// in debug mode, still advance compositing state so the viewer updates correctly
 				T = test_T;
 				last_contributor = contributor;
+                if (T < 0.0001f)
+                {
+                    done = true;
+                }
 				continue;
 			}
 #endif
@@ -640,6 +642,11 @@ renderCUDA(
 			// Keep track of last range entry to update this
 			// pixel.
 			last_contributor = contributor;
+
+            if (T < 0.0001f)
+            {
+                done = true;
+            }
 		}
 	}
 
