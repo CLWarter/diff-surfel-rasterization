@@ -194,3 +194,9 @@
 #ifndef LIGHT_DEBUG_SCALE
 #define LIGHT_DEBUG_SCALE 1.0f
 #endif
+
+// -----------
+// Comes from original 2DGS code itself
+#ifndef LIGHT_ALPHA_SKIP_THRESHOLD
+#define LIGHT_ALPHA_SKIP_THRESHOLD (1.0f / 255.0f)
+#endif

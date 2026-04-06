@@ -448,7 +448,7 @@ renderCUDA(
 			// Avoid numerical instabilities (see paper appendix). 
 			const float G = exp(power);
 			const float alpha = min(0.99f, opa * G);
-			if (alpha < 1.0f / 255.0f)
+			if (alpha < LIGHT_ALPHA_SKIP_THRESHOLD)
 				continue;
 
 			float test_T = T * (1 - alpha);
