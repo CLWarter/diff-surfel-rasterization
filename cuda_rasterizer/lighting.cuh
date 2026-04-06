@@ -3,6 +3,35 @@
 
 struct LightingOut {
     // final grouped outputs
+    float3 diffuse_rgb;
+    float3 spec_rgb;
+    float3 brdf_rgb;
+
+    // angular/light terms
+    float lambert;
+    float ndotl, ndotv, ndoth, vdoth;
+    float spot;
+    float inv;
+    float Li;        // final intensity
+    float I;
+    float li_clamped;
+
+    float metallic;
+    float roughness;
+    float alpha;      // roughness^2
+    float alpha2;
+    float F0;
+
+    float D;
+    float G;
+    float Gv;
+    float Gl;
+    float fresnel;
+
+    float dI_raw;
+    float dmetal_raw;
+    float drough_raw;
+
     float diffuse_mul;   // = diffuse_amb + diffuse_dir
     float spec_add;      // final additive specular
 
@@ -23,25 +52,13 @@ struct LightingOut {
     float spec_dir_gated;    // after LIGHT_SPEC_GATING, before ks
     float spec_base;         // alias/final pre-ks, old compatibility
 
-    // angular/light terms
-    float lambert;
-    float ndotl;
-    float ndotv;
-    float ndoth;
-    float spot;
-
     // ambient/intensity
     float ambient;
     float intensity;         // Li = I * inv 
-    float inv;
     float dintensity_ddepth;
-    float Li;        // final intensity
     float Li_raw;    // I * inv
-    float li_clamped;
-    float I;
 
     // learnable parameter chain terms
-    float dI_raw;
     float kspec;
     float dkspecular;
     float shiny;
@@ -219,6 +236,77 @@ __device__ __forceinline__ float shininess_value(const float* shiny_raw, float* 
 #endif
 }
 
+__device__ __forceinline__ float roughness_value(const float* roughness_raw, float* drough_draw_out)
+{
+#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
+    float t = sigmoidf_stable(roughness_raw[0]);
+    if (drough_draw_out)
+        *drough_draw_out = (1.0f - LIGHT_GGX_ROUGHNESS_MIN) * t * (1.0f - t);
+    return LIGHT_GGX_ROUGHNESS_MIN + (1.0f - LIGHT_GGX_ROUGHNESS_MIN) * t;
+#else
+    (void)roughness_raw;
+    if (drough_draw_out) *drough_draw_out = 0.0f;
+    return fmaxf(LIGHT_GGX_ROUGHNESS, LIGHT_GGX_ROUGHNESS_MIN);
+#endif
+}
+
+__device__ __forceinline__ float fresnel_schlick_scalar(float VdotH, float F0)
+{
+    float x = 1.0f - fmaxf(VdotH, 0.0f);
+    float x2 = x * x;
+    float x5 = x2 * x2 * x;
+    return F0 + (1.0f - F0) * x5;
+}
+
+__device__ __forceinline__ float ggx_D(float NdotH, float alpha2)
+{
+    float nh = fmaxf(NdotH, 0.0f);
+    float denom = nh * nh * (alpha2 - 1.0f) + 1.0f;
+    return alpha2 / (LIGHT_PI * denom * denom + LIGHT_GGX_DENOM_EPS);
+}
+
+__device__ __forceinline__ float smith_G1_schlick_ggx(float NdotX, float roughness)
+{
+    float nx = fmaxf(NdotX, 0.0f);
+    float r = roughness;
+    float k = ((r + 1.0f) * (r + 1.0f)) * 0.125f; // (r+1)^2 / 8
+    return nx / (nx * (1.0f - k) + k + LIGHT_GGX_DENOM_EPS);
+}
+
+__device__ __forceinline__ float ggx_specular_bridge(
+    float NdotL,
+    float NdotV,
+    float NdotH,
+    float VdotH,
+    float roughness,
+    float F0,
+    float* D_out = nullptr,
+    float* G_out = nullptr,
+    float* F_out = nullptr,
+    float* Gv_out = nullptr,
+    float* Gl_out = nullptr)
+{
+    float nv = fmaxf(NdotV, LIGHT_GGX_NV_EPS);
+    float nl = fmaxf(NdotL, LIGHT_GGX_NL_EPS);
+
+    float alpha = roughness * roughness;
+    float alpha2 = alpha * alpha;
+
+    float D = ggx_D(NdotH, alpha2);
+    float Gv = smith_G1_schlick_ggx(nv, roughness);
+    float Gl = smith_G1_schlick_ggx(nl, roughness);
+    float G = Gv * Gl;
+    float F = fresnel_schlick_scalar(VdotH, F0);
+
+    if (D_out)  *D_out = D;
+    if (G_out)  *G_out = G;
+    if (F_out)  *F_out = F;
+    if (Gv_out) *Gv_out = Gv;
+    if (Gl_out) *Gl_out = Gl;
+
+    return (D * G * F) / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
+}
+
 // Spotlight axis: camera forward (+Z)
 __device__ __forceinline__ float spotlight_factor(const float3& light_dir_cam_to_surf) {
 #if LIGHT_USE_SPOT
@@ -347,62 +435,77 @@ float3 pointcam_lighting_grad_approx(
         }
     }
 
-    // -------- spec via ndoth wrt H(P) --------
+        // -------- GGX bridge spec via ndoth / ndotl wrt point_cam --------
     #if LIGHT_USE_PHONG
         {
-            if (dL_dspec != 0.0f)
+            if (dL_dspec != 0.0f && Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
             {
-                const float NDOTH_MAX = 0.95f;
+                float dspec_dndoth = 0.0f;
+                float dspec_dndotl = 0.0f;
 
-                // forward used ndoth = clamp(dot(n_used, H), 0, NDOTH_MAX)
-                const float ndoth = Lout.ndoth; // clamped forward value
-                const float ndoth_raw = n_used.x * H.x + n_used.y * H.y + n_used.z * H.z;
-
-                float dL_dndoth = 0.0f;
-
-                // derivative exists only while ndoth_raw is inside unclamped interval
-                if (ndoth_raw > 0.0f && ndoth_raw < NDOTH_MAX)
                 {
-                    float spec_deriv = 0.0f;
-                    const float nd_eps = 1e-6f;
+                    const float nh = fmaxf(Lout.ndoth, 1e-6f);
+                    const float a2 = Lout.alpha2;
+                    const float t = nh * nh * (a2 - 1.0f) + 1.0f;
+                    const float dD_dnh =
+                        (-4.0f * LIGHT_PI * a2 * nh * (a2 - 1.0f) * t) /
+                        fmaxf((LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS) * (LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS), 1e-8f);
 
-                    if (ndoth > nd_eps)
-                        spec_deriv = Lout.shiny * (Lout.spec_pow / ndoth);
+                    float pref = (Lout.G * Lout.fresnel) /
+                        fmaxf(4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS) * fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS), LIGHT_GGX_DENOM_EPS);
 
-                    float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot * Lout.intensity;
-
-                    #if (LIGHT_SPEC_GATING == 1)
-                        if (Lout.ndotl <= 0.0f) dspec_dndoth = 0.0f;
-                    #elif (LIGHT_SPEC_GATING == 2)
-                        dspec_dndoth *= Lout.lambert;
-                    #endif
-
-                    dL_dndoth = dL_dspec * dspec_dndoth;
+                    dspec_dndoth = Lout.kspec * dD_dnh * Lout.spot * Lout.intensity * pref;
                 }
 
-                if (dL_dndoth != 0.0f)
                 {
-                    // ndoth = dot(n_used, H)
+                    float denom = fmaxf(4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS) * fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS), LIGHT_GGX_DENOM_EPS);
+                    float numer = Lout.D * Lout.G * Lout.fresnel;
+                    float dspecbrdf_dnl = -numer * (4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS)) / (denom * denom);
+                    dspec_dndotl = Lout.kspec * dspecbrdf_dnl * Lout.spot * Lout.intensity;
+                }
+
+                #if (LIGHT_SPEC_GATING == 1)
+                    if (Lout.ndotl <= 0.0f) {
+                        dspec_dndoth = 0.0f;
+                        dspec_dndotl = 0.0f;
+                    }
+                #elif (LIGHT_SPEC_GATING == 2)
+                    dspec_dndoth *= Lout.lambert;
+                #endif
+
+                if (dspec_dndoth != 0.0f)
+                {
                     float3 gH = make_float3(
-                        dL_dndoth * n_used.x,
-                        dL_dndoth * n_used.y,
-                        dL_dndoth * n_used.z
+                        dL_dspec * dspec_dndoth * n_used.x,
+                        dL_dspec * dspec_dndoth * n_used.y,
+                        dL_dspec * dspec_dndoth * n_used.z
                     );
 
                     float3 gHraw = apply_norm_jacobian(Hraw, gH);
 
-                    // Hraw = L + V
                     float3 gL = gHraw;
                     float3 gV = gHraw;
 
-                    // V = normalize(-P)
                     float3 negP = make_float3(-P.x, -P.y, -P.z);
                     float3 gNegP = apply_norm_jacobian(negP, gV);
                     gP.x -= gNegP.x;
                     gP.y -= gNegP.y;
                     gP.z -= gNegP.z;
 
-                    // L = normalize(light_pos - P)
+                    float3 gLraw = apply_norm_jacobian(Lraw, gL);
+                    gP.x -= gLraw.x;
+                    gP.y -= gLraw.y;
+                    gP.z -= gLraw.z;
+                }
+
+                if (dspec_dndotl != 0.0f)
+                {
+                    float3 gL = make_float3(
+                        dL_dspec * dspec_dndotl * n_used.x,
+                        dL_dspec * dspec_dndotl * n_used.y,
+                        dL_dspec * dspec_dndotl * n_used.z
+                    );
+
                     float3 gLraw = apply_norm_jacobian(Lraw, gL);
                     gP.x -= gLraw.x;
                     gP.y -= gLraw.y;
@@ -547,6 +650,16 @@ LightingOut eval_lighting(
     o.spec_dir_raw       = 0.0f;
     o.spec_dir_gated     = 0.0f;
     o.spec_base          = 0.0f;
+
+    o.roughness          = LIGHT_GGX_ROUGHNESS;
+    o.alpha              = LIGHT_GGX_ROUGHNESS * LIGHT_GGX_ROUGHNESS;
+    o.alpha2             = o.alpha * o.alpha;
+    o.F0                 = LIGHT_GGX_F0_DIELECTRIC;
+    o.fresnel            = o.F0;
+    o.D                  = 0.0f;
+    o.G                  = 0.0f;
+    o.Gv                 = 0.0f;
+    o.Gl                 = 0.0f;
 
     o.lambert            = 1.0f;
     o.ndotl              = 1.0f;
@@ -712,14 +825,21 @@ o.intensity = Li;
   #endif
     //dkspecular = fminf(dkspecular, 4.0f); // Clamp with 4.0 highest as more would be unrealistic (more for debug)
 
-    float dshin_draw = 0.0f;
-    float shin = shininess_value(shiny, &dshin_draw);
-    //shin = fminf(shin, 64.0f); // Clamp with 64.0 highest as more would be unrealistic (mostly for debug)
+    float drough_draw = 0.0f;
+    float rough = roughness_value(shiny, &drough_draw); // temporary port: reuse shiny storage for now if enabled later
 
     o.kspec = ks;
     o.dkspecular = dkspecular;
-    o.shiny = shin;
-    o.dshin_raw = dshin_draw;
+
+    // legacy fields kept alive for now
+    o.shiny = 0.0f;
+    o.dshin_raw = 0.0f;
+
+    // GGX fields
+    o.roughness = rough;
+    o.alpha = rough * rough;
+    o.alpha2 = o.alpha * o.alpha;
+    o.F0 = LIGHT_GGX_F0_DIELECTRIC;
 #endif
 
 // diffuse decomposition
@@ -757,19 +877,33 @@ o.intensity = Li;
     o.diffuse_dir      = o.direct_diffuse;
 #endif
 
-    #if LIGHT_USE_PHONG
+#if LIGHT_USE_PHONG
     float3 Hh = normalize_or_default(
         make_float3(L.x + V.x, L.y + V.y, L.z + V.z),
         make_float3(0.f, 0.f, -1.f)
     );
 
-    const float NDOTH_MAX = 0.95f;
-    float ndoth_raw = n.x * Hh.x + n.y * Hh.y + n.z * Hh.z;
-    float ndoth = fminf(fmaxf(ndoth_raw, 0.0f), NDOTH_MAX);
+    float ndoth = fmaxf(n.x * Hh.x + n.y * Hh.y + n.z * Hh.z, 0.0f);
+    float vdoth = fmaxf(V.x * Hh.x + V.y * Hh.y + V.z * Hh.z, 0.0f);
     o.ndoth = ndoth;
 
-    float spec_pow = (ndoth > 0.0f) ? powf(ndoth, o.shiny) : 0.0f;
-    float spec_dir_raw = spec_pow * spot * Li;
+    float D = 0.0f, G = 0.0f, F = 0.0f, Gv = 0.0f, Gl = 0.0f;
+    float spec_brdf = 0.0f;
+
+    if (ndotl > 0.0f && o.ndotv > 0.0f)
+    {
+        spec_brdf = ggx_specular_bridge(
+            ndotl,
+            o.ndotv,
+            ndoth,
+            vdoth,
+            o.roughness,
+            o.F0,
+            &D, &G, &F, &Gv, &Gl
+        );
+    }
+
+    float spec_dir_raw = spec_brdf * spot * Li;
     float spec_dir_gated = spec_dir_raw;
 
     #if (LIGHT_SPEC_GATING == 1)
@@ -778,17 +912,30 @@ o.intensity = Li;
         spec_dir_gated *= lambert;
     #endif
 
-    o.spec_pow        = spec_pow;
-    o.spec_dir_raw    = spec_dir_raw;
-    o.spec_dir_gated  = spec_dir_gated;
-    o.spec_base       = spec_dir_gated;
-    o.spec_add        = o.kspec * spec_dir_gated;
+    o.D              = D;
+    o.G              = G;
+    o.Gv             = Gv;
+    o.Gl             = Gl;
+    o.fresnel        = F;
+
+    // legacy aliases kept for the rest of the code
+    o.spec_pow       = D;
+    o.spec_dir_raw   = spec_dir_raw;
+    o.spec_dir_gated = spec_dir_gated;
+    o.spec_base      = spec_dir_gated;
+    o.spec_add       = o.kspec * spec_dir_gated;
 #else
     o.spec_pow        = 0.0f;
     o.spec_dir_raw    = 0.0f;
     o.spec_dir_gated  = 0.0f;
     o.spec_base       = 0.0f;
     o.spec_add        = 0.0f;
+
+    o.D               = 0.0f;
+    o.G               = 0.0f;
+    o.Gv              = 0.0f;
+    o.Gl              = 0.0f;
+    o.fresnel         = o.F0;
 #endif
 
 #endif

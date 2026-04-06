@@ -85,6 +85,37 @@
 #define LIGHT_PHONG_SHININESS 16.0f
 #endif
 
+// ------------------ GGX bridge settings ------------------
+// specular with GGX using a fixed roughness for now.
+
+#ifndef LIGHT_GGX_ROUGHNESS_MODE
+#define LIGHT_GGX_ROUGHNESS_MODE 0   // 0 = fixed, 1 = later learnable
+#endif
+
+#ifndef LIGHT_GGX_ROUGHNESS
+#define LIGHT_GGX_ROUGHNESS 0.35f
+#endif
+
+#ifndef LIGHT_GGX_ROUGHNESS_MIN
+#define LIGHT_GGX_ROUGHNESS_MIN 0.04f
+#endif
+
+#ifndef LIGHT_GGX_F0_DIELECTRIC
+#define LIGHT_GGX_F0_DIELECTRIC 0.04f
+#endif
+
+#ifndef LIGHT_GGX_NV_EPS
+#define LIGHT_GGX_NV_EPS 1e-4f
+#endif
+
+#ifndef LIGHT_GGX_NL_EPS
+#define LIGHT_GGX_NL_EPS 1e-4f
+#endif
+
+#ifndef LIGHT_GGX_DENOM_EPS
+#define LIGHT_GGX_DENOM_EPS 1e-6f
+#endif
+
 // --------------------- Intensity ---------------------
 // 0 = constant intensity (uses LIGHT_INTENSITY_CONST)
 // 1 = learnable intensity (uses sigmoid(intensity_raw[0]) mapped to [MIN, MAX])

@@ -514,22 +514,8 @@ renderCUDA(
 			}
 			#endif
 
-			#if LIGHT_USE_PHONG && (LIGHT_PHONG_SHININESS_MODE == 1)
-			{
-				const float ndoth = Lout.ndoth;
-
-				if (dL_dspec != 0.0f && ndoth > 0.0f)
-				{
-					const float ln_ndoth = logf(fmaxf(ndoth, 1e-8f));
-					const float dspecpow_dshin = Lout.spec_pow * ln_ndoth;
-
-					const float mult = (Lout.spec_pow > 0.0f) ? (Lout.spec_dir_gated / Lout.spec_pow) : 0.0f;
-					const float dspecadd_dshin = Lout.kspec * (mult * dspecpow_dshin);
-
-					atomicAdd(&dL_dshiny[global_id], dL_dspec * dspecadd_dshin * Lout.dshin_raw);
-				}
-			}
-			#endif
+			// Step 1 GGX bridge:
+			// no shininess learning anymore; roughness is fixed for now.
 
 			// ---------- Normal gradient approximation ----------
 			if (dL_ddiffuse != 0.0f || dL_dspec != 0.0f)
@@ -604,39 +590,66 @@ renderCUDA(
 				#if LIGHT_USE_PHONG
 				{
 					const float NDOTH_MAX = 0.95f;
-					const float ndoth = Lout.ndoth;
-					const float ndoth_raw = n.x * Hh.x + n.y * Hh.y + n.z * Hh.z;
-
-					if (dL_dspec != 0.0f)
+					if (dL_dspec != 0.0f && Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
 					{
-						float dL_dndoth = 0.0f;
+						// Step 1 bridge approximation:
+						// treat GGX D/G/F as locally frozen with respect to n except through NdotL / NdotH.
+						// This is not the final full derivative, but it is a practical bridge.
+						float dspec_dndoth = 0.0f;
+						float dspec_dndotl = 0.0f;
 
-						if (ndoth_raw > 0.0f && ndoth_raw < NDOTH_MAX)
+						// D term sensitivity wrt NdotH
 						{
-							float spec_deriv = 0.0f;
-							const float nd_eps = 1e-6f;
+						 const float nh = fmaxf(Lout.ndoth, 1e-6f);
+						 const float a2 = Lout.alpha2;
+						 const float t = nh * nh * (a2 - 1.0f) + 1.0f;
+						 const float dD_dnh =
+							 (-4.0f * LIGHT_PI * a2 * nh * (a2 - 1.0f) * t) /
+							 fmaxf((LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS) * (LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS), 1e-8f);
 
-							if (ndoth > nd_eps)
-							{
-								spec_deriv = Lout.shiny * (Lout.spec_pow / ndoth);
-							}
+						 float pref = (Lout.G * Lout.fresnel) /
+							 fmaxf(4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS) * fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS), LIGHT_GGX_DENOM_EPS);
 
-							float dspec_dndoth = Lout.kspec * spec_deriv * Lout.spot * Lout.intensity;
-
-							#if (LIGHT_SPEC_GATING == 1)
-								if (Lout.ndotl <= 0.0f) dspec_dndoth = 0.0f;
-							#elif (LIGHT_SPEC_GATING == 2)
-								dspec_dndoth *= Lout.lambert;
-							#endif
-
-							dL_dndoth = dL_dspec * dspec_dndoth;
+						 dspec_dndoth = dD_dnh * pref * Lout.spot * Lout.intensity;
 						}
+
+						// denominator sensitivity wrt NdotL
+						{
+						 float denom = fmaxf(4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS) * fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS), LIGHT_GGX_DENOM_EPS);
+						 float numer = Lout.D * Lout.G * Lout.fresnel;
+						 float dspecbrdf_dnl = -numer * (4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS)) / (denom * denom);
+						 dspec_dndotl = dspecbrdf_dnl * Lout.spot * Lout.intensity;
+						}
+
+						#if (LIGHT_SPEC_GATING == 1)
+							if (Lout.ndotl <= 0.0f) {
+								dspec_dndoth = 0.0f;
+								dspec_dndotl = 0.0f;
+							}
+						#elif (LIGHT_SPEC_GATING == 2)
+							dspec_dndoth *= Lout.lambert;
+							// plus lambert path contribution
+							dspec_dndotl += (Lout.kspec * Lout.spec_dir_raw);
+						#endif
+
+						dspec_dndoth *= Lout.kspec;
+						dspec_dndotl *= Lout.kspec;
+
+						float dL_dndoth = dL_dspec * dspec_dndoth;
+						float dL_dndotl_from_spec = dL_dspec * dspec_dndotl;
 
 						if (dL_dndoth != 0.0f)
 						{
 							g_unit.x += dL_dndoth * Hh.x;
 							g_unit.y += dL_dndoth * Hh.y;
 							g_unit.z += dL_dndoth * Hh.z;
+						}
+
+						if (dL_dndotl_from_spec != 0.0f)
+						{
+							g_unit.x += dL_dndotl_from_spec * Lvec.x;
+							g_unit.y += dL_dndotl_from_spec * Lvec.y;
+							g_unit.z += dL_dndotl_from_spec * Lvec.z;
 						}
 					}
 				}
