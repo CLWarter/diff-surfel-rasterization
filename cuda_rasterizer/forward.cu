@@ -635,15 +635,18 @@ renderCUDA(
 			for (int ch = 0; ch < CHANNELS; ch++) {
 				const float albedo = features[collected_id[j] * CHANNELS + ch];
 
-				// indirect / ambient approximation
-				C[ch] += albedo * w_indirect;
-
-				// direct Lambertian BRDF term
-				C[ch] += albedo * w_direct;
-			
-				// Specular added to RGB
 				#if LIGHT_USE_PHONG
-				if (ch < 3) C[ch] += w * ((&Lout.spec_add_rgb.x)[ch]);
+				if (ch < 3)
+				{
+					C[ch] += albedo * w * ((&Lout.diffuse_mul_rgb.x)[ch]);
+					C[ch] += w * ((&Lout.spec_add_rgb.x)[ch]);
+				}
+				else
+				{
+					C[ch] += albedo * w_direct;
+				}
+				#else
+				C[ch] += albedo * w_direct;
 				#endif
 			}
 

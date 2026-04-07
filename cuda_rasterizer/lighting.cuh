@@ -2,10 +2,19 @@
 #include "lighting_config.cuh"
 
 struct LightingOut {
-    // final grouped outputs
+    // material-only BRDF terms
+    // diffuse_rgb = kD / pi   (no light, no ambient)
+    // spec_rgb    = GGX Cook-Torrance BRDF term (no light)
+    // brdf_rgb    = diffuse_rgb + spec_rgb
     float3 diffuse_rgb;
     float3 spec_rgb;
     float3 brdf_rgb;
+
+    // shading decomposition used by the renderer
+    // indirect_approx_rgb is NOT part of the BRDF.
+    // It is only an approximate indirect ambient irradiance multiplier.
+    float3 indirect_approx_rgb;   // scalar ambient expanded to RGB multiplier
+    float3 direct_diffuse_rgb;    // diffuse BRDF after direct light evaluation
 
     // angular/light terms
     float lambert;
@@ -33,8 +42,9 @@ struct LightingOut {
     float dmetal_raw;
     float drough_raw;
 
-    float diffuse_mul;   // = diffuse_amb + diffuse_dir
-    float spec_add;      // final additive specular
+    float diffuse_mul;   // legacy scalar proxy
+    float3 diffuse_mul_rgb; // per-channel diffuse multiplier
+    float spec_add;      // legacy scalar alias = luminance-ish proxy of RGB spec
     float3 spec_add_rgb; // final additive RGB specular
 
     // diffuse decomposition
@@ -410,8 +420,8 @@ float3 pointcam_lighting_grad_approx(
     const LightingOut& Lout,
     const float3& point_cam,
     const float3& n_used,      // use the same normal you use in backward approximation
-    float dL_ddiffuse,
-    float dL_dspec)
+    const float3& dL_ddiffuse_rgb,
+    const float3& dL_dspec_rgb)
 {
     const float3 light_pos = make_float3(0.0f, 0.0f, 0.0f);
 
@@ -439,11 +449,14 @@ float3 pointcam_lighting_grad_approx(
         // diffuse contribution
         #if LIGHT_USE_LAMBERT
         {
-            float dLambert_from_diffuse = dL_ddiffuse * Lout.diffuse_brdf * Lout.spot * Lout.intensity;
-
-            // New BRDF path:
-            // diffuse attenuation is already handled in forward via kd=(1-F)(1-metallic),
-            // so do not apply the old kspec energy compensation here.
+            float dLambert_from_diffuse = 0.0f;
+            if (Lout.lambert > 1e-6f)
+            {
+                dLambert_from_diffuse =
+                    dL_ddiffuse_rgb.x * (Lout.direct_diffuse_rgb.x / Lout.lambert) +
+                    dL_ddiffuse_rgb.y * (Lout.direct_diffuse_rgb.y / Lout.lambert) +
+                    dL_ddiffuse_rgb.z * (Lout.direct_diffuse_rgb.z / Lout.lambert);
+            }
 
             dL_dlambert += dLambert_from_diffuse;
         }
@@ -453,7 +466,10 @@ float3 pointcam_lighting_grad_approx(
         #if LIGHT_USE_PHONG && (LIGHT_SPEC_GATING == 2)
         {
             // spec_dir_raw already represents the current pre-gated scalar spec proxy.
-            float dLambert_from_spec = dL_dspec * Lout.spec_dir_raw;
+            float dLambert_from_spec =
+                dL_dspec_rgb.x * Lout.spec_dir_raw_rgb.x +
+                dL_dspec_rgb.y * Lout.spec_dir_raw_rgb.y +
+                dL_dspec_rgb.z * Lout.spec_dir_raw_rgb.z;
             dL_dlambert += dLambert_from_spec;
         }
         #endif
@@ -486,50 +502,78 @@ float3 pointcam_lighting_grad_approx(
         }
     }
 
-        // -------- GGX bridge spec via ndoth / ndotl wrt point_cam --------
+// -------- GGX RGB spec via ndoth / ndotl wrt point_cam --------
     #if LIGHT_USE_PHONG
         {
-            if (dL_dspec != 0.0f && Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
+            if ((dL_dspec_rgb.x != 0.0f || dL_dspec_rgb.y != 0.0f || dL_dspec_rgb.z != 0.0f) &&
+                Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
             {
-                float dspec_dndoth = 0.0f;
-                float dspec_dndotl = 0.0f;
+                const float nh = fmaxf(Lout.ndoth, 1e-6f);
+                const float a2 = Lout.alpha2;
+                const float t = nh * nh * (a2 - 1.0f) + 1.0f;
+                const float dD_dnh =
+                    (-4.0f * LIGHT_PI * a2 * nh * (a2 - 1.0f) * t) /
+                    fmaxf((LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS) * (LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS), 1e-8f);
 
-                {
-                    const float nh = fmaxf(Lout.ndoth, 1e-6f);
-                    const float a2 = Lout.alpha2;
-                    const float t = nh * nh * (a2 - 1.0f) + 1.0f;
-                    const float dD_dnh =
-                        (-4.0f * LIGHT_PI * a2 * nh * (a2 - 1.0f) * t) /
-                        fmaxf((LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS) * (LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS), 1e-8f);
+                const float denom = fmaxf(
+                    4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS) * fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS),
+                    LIGHT_GGX_DENOM_EPS
+                );
 
-                    float pref = (Lout.G * Lout.fresnel) /
-                        fmaxf(4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS) * fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS), LIGHT_GGX_DENOM_EPS);
+                const float3 pref_rgb = make_float3(
+                    (Lout.G * Lout.fresnel_rgb.x) / denom,
+                    (Lout.G * Lout.fresnel_rgb.y) / denom,
+                    (Lout.G * Lout.fresnel_rgb.z) / denom
+                );
 
-                    dspec_dndoth = dD_dnh * Lout.spot * Lout.intensity * pref;
-                }
+                float3 dspec_dndoth_rgb = make_float3(
+                    dD_dnh * Lout.spot * Lout.Li * pref_rgb.x,
+                    dD_dnh * Lout.spot * Lout.Li * pref_rgb.y,
+                    dD_dnh * Lout.spot * Lout.Li * pref_rgb.z
+                );
 
-                {
-                    float denom = fmaxf(4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS) * fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS), LIGHT_GGX_DENOM_EPS);
-                    float numer = Lout.D * Lout.G * Lout.fresnel;
-                    float dspecbrdf_dnl = -numer * (4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS)) / (denom * denom);
-                    dspec_dndotl = dspecbrdf_dnl * Lout.spot * Lout.intensity;
-                }
+                const float common_nl = (4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS)) / (denom * denom);
+
+                float3 dspec_dndotl_rgb = make_float3(
+                    -(Lout.D * Lout.G * Lout.fresnel_rgb.x) * common_nl * Lout.spot * Lout.Li,
+                    -(Lout.D * Lout.G * Lout.fresnel_rgb.y) * common_nl * Lout.spot * Lout.Li,
+                    -(Lout.D * Lout.G * Lout.fresnel_rgb.z) * common_nl * Lout.spot * Lout.Li
+                );
 
                 #if (LIGHT_SPEC_GATING == 1)
                     if (Lout.ndotl <= 0.0f) {
-                        dspec_dndoth = 0.0f;
-                        dspec_dndotl = 0.0f;
+                        dspec_dndoth_rgb = make_float3(0.0f, 0.0f, 0.0f);
+                        dspec_dndotl_rgb = make_float3(0.0f, 0.0f, 0.0f);
                     }
                 #elif (LIGHT_SPEC_GATING == 2)
-                    dspec_dndoth *= Lout.lambert;
+                    dspec_dndoth_rgb = make_float3(
+                        dspec_dndoth_rgb.x * Lout.lambert,
+                        dspec_dndoth_rgb.y * Lout.lambert,
+                        dspec_dndoth_rgb.z * Lout.lambert
+                    );
+                    dspec_dndotl_rgb = make_float3(
+                        dspec_dndotl_rgb.x + Lout.spec_dir_raw_rgb.x,
+                        dspec_dndotl_rgb.y + Lout.spec_dir_raw_rgb.y,
+                        dspec_dndotl_rgb.z + Lout.spec_dir_raw_rgb.z
+                    );
                 #endif
 
-                if (dspec_dndoth != 0.0f)
+                float dL_dndoth =
+                    dL_dspec_rgb.x * dspec_dndoth_rgb.x +
+                    dL_dspec_rgb.y * dspec_dndoth_rgb.y +
+                    dL_dspec_rgb.z * dspec_dndoth_rgb.z;
+
+                float dL_dndotl =
+                    dL_dspec_rgb.x * dspec_dndotl_rgb.x +
+                    dL_dspec_rgb.y * dspec_dndotl_rgb.y +
+                    dL_dspec_rgb.z * dspec_dndotl_rgb.z;
+
+                if (dL_dndoth != 0.0f)
                 {
                     float3 gH = make_float3(
-                        dL_dspec * dspec_dndoth * n_used.x,
-                        dL_dspec * dspec_dndoth * n_used.y,
-                        dL_dspec * dspec_dndoth * n_used.z
+                        dL_dndoth * n_used.x,
+                        dL_dndoth * n_used.y,
+                        dL_dndoth * n_used.z
                     );
 
                     float3 gHraw = apply_norm_jacobian(Hraw, gH);
@@ -549,12 +593,12 @@ float3 pointcam_lighting_grad_approx(
                     gP.z -= gLraw.z;
                 }
 
-                if (dspec_dndotl != 0.0f)
+                if (dL_dndotl != 0.0f)
                 {
                     float3 gL = make_float3(
-                        dL_dspec * dspec_dndotl * n_used.x,
-                        dL_dspec * dspec_dndotl * n_used.y,
-                        dL_dspec * dspec_dndotl * n_used.z
+                        dL_dndotl * n_used.x,
+                        dL_dndotl * n_used.y,
+                        dL_dndotl * n_used.z
                     );
 
                     float3 gLraw = apply_norm_jacobian(Lraw, gL);
@@ -588,26 +632,46 @@ float3 pointcam_lighting_grad_approx(
                 ds_dcos *= LIGHT_SPOT_EXP * powf(fmaxf(s0, 1e-8f), LIGHT_SPOT_EXP - 1.0f);
             }
 
-            float dDiffuse_dSpot = 0.0f;
+            float dL_dSpot = 0.0f;
+
             #if LIGHT_USE_LAMBERT
-                dDiffuse_dSpot = dL_ddiffuse * Lout.diffuse_brdf * Lout.lambert * Lout.intensity;
-                // New BRDF path:
-                // no old kspec-based diffuse attenuation here.
+            {
+                float3 dDiff_dSpot_rgb = make_float3(0.0f, 0.0f, 0.0f);
+                if (Lout.spot > 1e-6f)
+                {
+                    dDiff_dSpot_rgb = make_float3(
+                        Lout.direct_diffuse_rgb.x / Lout.spot,
+                        Lout.direct_diffuse_rgb.y / Lout.spot,
+                        Lout.direct_diffuse_rgb.z / Lout.spot
+                    );
+                }
+
+                dL_dSpot += dL_ddiffuse_rgb.x * dDiff_dSpot_rgb.x;
+                dL_dSpot += dL_ddiffuse_rgb.y * dDiff_dSpot_rgb.y;
+                dL_dSpot += dL_ddiffuse_rgb.z * dDiff_dSpot_rgb.z;
+            }
             #endif
 
-            float dSpec_dSpot = 0.0f;
             #if LIGHT_USE_PHONG
-                float base = Lout.spec_add / fmaxf(Lout.spot, 1e-6f);
+            {
+                float3 dSpec_dSpot_rgb = make_float3(
+                    Lout.spec_add_rgb.x / fmaxf(Lout.spot, 1e-6f),
+                    Lout.spec_add_rgb.y / fmaxf(Lout.spot, 1e-6f),
+                    Lout.spec_add_rgb.z / fmaxf(Lout.spot, 1e-6f)
+                );
+
                 #if (LIGHT_SPEC_GATING == 1)
-                    if (Lout.ndotl > 0.0f) dSpec_dSpot = dL_dspec * base;
-                #elif (LIGHT_SPEC_GATING == 2)
-                    dSpec_dSpot = dL_dspec * base;
-                #else
-                    dSpec_dSpot = dL_dspec * base;
+                    if (Lout.ndotl <= 0.0f)
+                        dSpec_dSpot_rgb = make_float3(0.0f, 0.0f, 0.0f);
                 #endif
+
+                dL_dSpot += dL_dspec_rgb.x * dSpec_dSpot_rgb.x;
+                dL_dSpot += dL_dspec_rgb.y * dSpec_dSpot_rgb.y;
+                dL_dSpot += dL_dspec_rgb.z * dSpec_dSpot_rgb.z;
+            }
             #endif
 
-            float dL_dcos = (dDiffuse_dSpot + dSpec_dSpot) * ds_dcos;
+            float dL_dcos = dL_dSpot * ds_dcos;
 
             float3 g_view = make_float3(0.f, 0.f, dL_dcos);
             float3 gP_view = apply_norm_jacobian(P, g_view);
@@ -622,25 +686,46 @@ float3 pointcam_lighting_grad_approx(
     // -------- falloff wrt point_cam --------
 #if (FALLOFF_MODE == 1)
     {
-        float dDiff_dLi = 0.0f;
+        float dL_dLi = 0.0f;
+
         #if LIGHT_USE_LAMBERT
-            dDiff_dLi = Lout.diffuse_brdf * Lout.lambert * Lout.spot;
-            // New BRDF path:
-            // no old kspec-based diffuse attenuation here.
+        {
+            const float3 dDiff_dLi_rgb = make_float3(
+                Lout.direct_diffuse_rgb.x / fmaxf(Lout.Li, 1e-6f),
+                Lout.direct_diffuse_rgb.y / fmaxf(Lout.Li, 1e-6f),
+                Lout.direct_diffuse_rgb.z / fmaxf(Lout.Li, 1e-6f)
+            );
+
+            dL_dLi += dL_ddiffuse_rgb.x * dDiff_dLi_rgb.x;
+            dL_dLi += dL_ddiffuse_rgb.y * dDiff_dLi_rgb.y;
+            dL_dLi += dL_ddiffuse_rgb.z * dDiff_dLi_rgb.z;
+        }
         #endif
 
-        float dSpec_dLi = 0.0f;
         #if LIGHT_USE_PHONG
-            float base = Lout.spec_add / fmaxf(Lout.Li, 1e-6f);
-            #if (LIGHT_SPEC_GATING == 1)
-                if (Lout.ndotl <= 0.0f) base = 0.0f;
-            #elif (LIGHT_SPEC_GATING == 2)
-                base *= Lout.lambert;
-            #endif
-            dSpec_dLi = base;
-        #endif
+        {
+            float3 dSpec_dLi_rgb = make_float3(
+                Lout.spec_add_rgb.x / fmaxf(Lout.Li, 1e-6f),
+                Lout.spec_add_rgb.y / fmaxf(Lout.Li, 1e-6f),
+                Lout.spec_add_rgb.z / fmaxf(Lout.Li, 1e-6f)
+            );
 
-        float dL_dLi = dL_ddiffuse * dDiff_dLi + dL_dspec * dSpec_dLi;
+            #if (LIGHT_SPEC_GATING == 1)
+                if (Lout.ndotl <= 0.0f)
+                    dSpec_dLi_rgb = make_float3(0.0f, 0.0f, 0.0f);
+            #elif (LIGHT_SPEC_GATING == 2)
+                dSpec_dLi_rgb = make_float3(
+                    dSpec_dLi_rgb.x * Lout.lambert,
+                    dSpec_dLi_rgb.y * Lout.lambert,
+                    dSpec_dLi_rgb.z * Lout.lambert
+                );
+            #endif
+
+            dL_dLi += dL_dspec_rgb.x * dSpec_dLi_rgb.x;
+            dL_dLi += dL_dspec_rgb.y * dSpec_dLi_rgb.y;
+            dL_dLi += dL_dspec_rgb.z * dSpec_dLi_rgb.z;
+        }
+        #endif
 
         float3 LP = make_float3(P.x - light_pos.x, P.y - light_pos.y, P.z - light_pos.z);
         float dist2 = fmaxf(LP.x*LP.x + LP.y*LP.y + LP.z*LP.z, 1e-4f);
@@ -683,9 +768,17 @@ LightingOut eval_lighting(
     const float3* point_cam_opt = nullptr
 ) {
     LightingOut o = {};
-    o.diffuse_mul        = 1.0f;
+    o.diffuse_mul        = 0.0f;
+    o.diffuse_mul_rgb    = make_float3(0.0f, 0.0f, 0.0f);
+
     o.spec_add           = 0.0f;
     o.spec_add_rgb       = make_float3(0.0f, 0.0f, 0.0f);
+
+    o.diffuse_rgb        = make_float3(0.0f, 0.0f, 0.0f);
+    o.spec_rgb           = make_float3(0.0f, 0.0f, 0.0f);
+    o.brdf_rgb           = make_float3(0.0f, 0.0f, 0.0f);
+    o.indirect_approx_rgb = make_float3(0.0f, 0.0f, 0.0f);
+    o.direct_diffuse_rgb  = make_float3(0.0f, 0.0f, 0.0f);
 
     o.diffuse_brdf       = 0.0f;
 
@@ -710,6 +803,7 @@ LightingOut eval_lighting(
     o.roughness          = LIGHT_GGX_ROUGHNESS;
     o.alpha              = LIGHT_GGX_ROUGHNESS * LIGHT_GGX_ROUGHNESS;
     o.alpha2             = o.alpha * o.alpha;
+
     o.F0                 = LIGHT_GGX_F0_DIELECTRIC;
     o.fresnel            = o.F0;
     o.D                  = 0.0f;
@@ -735,17 +829,6 @@ LightingOut eval_lighting(
 
     o.metallic           = LIGHT_GGX_METALLIC;
     o.dmetal_raw         = 0.0f;
-
-    o.roughness          = LIGHT_GGX_ROUGHNESS;
-    o.alpha              = LIGHT_GGX_ROUGHNESS * LIGHT_GGX_ROUGHNESS;
-    o.alpha2             = o.alpha * o.alpha;
-
-    o.F0                 = LIGHT_GGX_F0_DIELECTRIC;
-    o.fresnel            = o.F0;
-    o.D                  = 0.0f;
-    o.G                  = 0.0f;
-    o.Gv                 = 0.0f;
-    o.Gl                 = 0.0f;
 
     o.F0_rgb             = make_float3(LIGHT_GGX_F0_DIELECTRIC, LIGHT_GGX_F0_DIELECTRIC, LIGHT_GGX_F0_DIELECTRIC);
     o.fresnel_rgb        = o.F0_rgb;
@@ -780,7 +863,7 @@ LightingOut eval_lighting(
                         depth_cam);
     }
 
-        // ------------------------------------------------------------
+    // ------------------------------------------------------------
     // Light position in camera space
     // ------------------------------------------------------------
     const float3 light_pos = make_float3(0.0f, 0.0f, 0.0f);
@@ -888,8 +971,6 @@ o.intensity = Li;
     float dmetal_draw = 0.0f;
     float metallic = metallic_value(metallic_raw, &dmetal_draw);
 
-    o.metallic = 0.0f;
-
     o.metallic = metallic;
     o.dmetal_raw = dmetal_draw;
 
@@ -923,6 +1004,7 @@ o.intensity = Li;
     #endif
 
     o.diffuse_mul = o.indirect_diffuse + o.direct_diffuse;
+    o.diffuse_mul_rgb = make_float3(o.diffuse_mul, o.diffuse_mul, o.diffuse_mul);
 
     o.diffuse_amb     = o.indirect_diffuse;
     o.diffuse_dir_raw = o.direct_diffuse_raw;
@@ -1005,17 +1087,56 @@ o.intensity = Li;
     // finalize metallic-aware diffuse:
     // kD = (1 - F) * (1 - metallic)
     {
-        float3 kd_rgb = make_float3(
+        const float3 kd_rgb = make_float3(
             (1.0f - F_rgb.x) * (1.0f - o.metallic),
             (1.0f - F_rgb.y) * (1.0f - o.metallic),
             (1.0f - F_rgb.z) * (1.0f - o.metallic)
         );
 
-        float kd = float3_avg(kd_rgb);
+        // ---------------- material-only BRDF ----------------
+        // diffuse_rgb/spec_rgb/brdf_rgb intentionally exclude ambient.
+        o.diffuse_rgb = make_float3(
+            o.diffuse_brdf * kd_rgb.x,
+            o.diffuse_brdf * kd_rgb.y,
+            o.diffuse_brdf * kd_rgb.z
+        );
 
-        o.direct_diffuse = o.direct_diffuse_raw * kd;
+        o.spec_rgb = spec_brdf_rgb;
+
+        o.brdf_rgb = make_float3(
+            o.diffuse_rgb.x + o.spec_rgb.x,
+            o.diffuse_rgb.y + o.spec_rgb.y,
+            o.diffuse_rgb.z + o.spec_rgb.z
+        );
+
+        // ---------------- renderer shading decomposition ----------------
+        // This is NOT part of the BRDF:
+        // ambient is only an approximate indirect irradiance scalar.
+        o.indirect_approx_rgb = make_float3(
+            o.indirect_diffuse,
+            o.indirect_diffuse,
+            o.indirect_diffuse
+        );
+
+        o.direct_diffuse_rgb = make_float3(
+            o.direct_diffuse_raw * kd_rgb.x,
+            o.direct_diffuse_raw * kd_rgb.y,
+            o.direct_diffuse_raw * kd_rgb.z
+        );
+
+        // Final diffuse shading multiplier used on base color:
+        // base_color * (indirect_approx + direct_diffuse)
+        o.diffuse_mul_rgb = make_float3(
+            o.indirect_approx_rgb.x + o.direct_diffuse_rgb.x,
+            o.indirect_approx_rgb.y + o.direct_diffuse_rgb.y,
+            o.indirect_approx_rgb.z + o.direct_diffuse_rgb.z
+        );
+
+        // legacy scalar proxies kept for older paths / debug
+        o.direct_diffuse = float3_avg(o.direct_diffuse_rgb);
+        o.diffuse_amb    = o.indirect_diffuse;
         o.diffuse_dir    = o.direct_diffuse;
-        o.diffuse_mul    = o.indirect_diffuse + o.direct_diffuse;
+        o.diffuse_mul    = float3_avg(o.diffuse_mul_rgb);
     }
 #else
     o.spec_pow          = 0.0f;
