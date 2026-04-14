@@ -971,12 +971,14 @@ o.intensity = Li;
     float dmetal_draw = 0.0f;
     float metallic = metallic_value(metallic_raw, &dmetal_draw);
 
-    o.metallic = metallic;
-    o.dmetal_raw = dmetal_draw;
-
     o.roughness = rough;
+    o.drough_raw = drough_draw;
+
     o.alpha = rough * rough;
     o.alpha2 = o.alpha * o.alpha;
+
+    o.metallic = metallic;
+    o.dmetal_raw = dmetal_draw;
 
     // scalar proxy stays for compatibility
     o.F0 = LIGHT_GGX_F0_DIELECTRIC * (1.0f - metallic) + float3_avg(base_color) * metallic;

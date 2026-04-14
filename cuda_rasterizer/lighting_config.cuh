@@ -89,15 +89,15 @@
 // specular with GGX using a fixed roughness for now.
 
 #ifndef LIGHT_GGX_ROUGHNESS_MODE
-#define LIGHT_GGX_ROUGHNESS_MODE 0   // 0 = fixed, 1 = later learnable
+#define LIGHT_GGX_ROUGHNESS_MODE 1   // 0 = fixed, 1 = later learnable
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS
-#define LIGHT_GGX_ROUGHNESS 0.02f
+#define LIGHT_GGX_ROUGHNESS 0.04f
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS_MIN
-#define LIGHT_GGX_ROUGHNESS_MIN 0.02f
+#define LIGHT_GGX_ROUGHNESS_MIN 0.04f
 #endif
 
 #ifndef LIGHT_GGX_F0_DIELECTRIC

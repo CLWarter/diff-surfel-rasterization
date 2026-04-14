@@ -392,7 +392,7 @@ renderCUDA(
 					ambients, intensity,
 					rough_ptr, metal_ptr,
 					base_rgb,
-					&point_cam
+					&center_cam
 				);
 
 				const float w = alpha * T;
@@ -726,15 +726,15 @@ renderCUDA(
 				dL_dspec_rgb.x != 0.0f || dL_dspec_rgb.y != 0.0f || dL_dspec_rgb.z != 0.0f)
 			{
 				// Unit normal used in forward
-				float3 view_ray = normalize_or_default(point_cam, make_float3(0.f, 0.f, 1.f));
+				float3 view_ray = normalize_or_default(center_cam, make_float3(0.f, 0.f, 1.f));
 
 				float3 n = normalize_or_default(n_raw, make_float3(0.f, 0.f, 1.f));
 
 				const float3 light_pos = make_float3(0.0f, 0.0f, 0.0f);
 
-				float3 Lvec = make_float3(light_pos.x - point_cam.x,
-										  light_pos.y - point_cam.y,
-										  light_pos.z - point_cam.z);
+				float3 Lvec = make_float3(light_pos.x - center_cam.x,
+										light_pos.y - center_cam.y,
+										light_pos.z - center_cam.z);
 				Lvec = normalize_or_default(Lvec, make_float3(0.f, 0.f, -1.f));
 
 				float3 Vvec = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
@@ -964,7 +964,7 @@ renderCUDA(
 				{
 					float3 n_for_geom = n;
 
-					float3 g_point_light = pointcam_lighting_grad_approx(
+					/*float3 g_point_light = pointcam_lighting_grad_approx(
 						Lout,
 						point_cam,
 						n_for_geom,
@@ -978,7 +978,7 @@ renderCUDA(
 
 					extra_dL_dsy += g_point_light.x * bv_cam.x +
 									g_point_light.y * bv_cam.y +
-									g_point_light.z * bv_cam.z;
+									g_point_light.z * bv_cam.z;*/
 				}
 			}
 

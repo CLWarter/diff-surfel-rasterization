@@ -482,7 +482,7 @@ renderCUDA(
                     ambients, intensity,
                     rough_ptr, metal_ptr,
                     base_rgb,
-                    &point_cam
+                    &center_cam
                 );
 
 				w_indirect = w * Lout.indirect_diffuse;
@@ -573,17 +573,21 @@ renderCUDA(
 				#elif (LIGHT_DEBUG_MODE == 10)
 					// metallic value / port
 					{
+						#if #if LIGHT_ENABLE_FWD && LIGHT_USE_PHONG
 						float dmetal_dummy = 0.0f;
 						float m_dbg = metallic_value(metal_ptr, &dmetal_dummy);
 						dbg = m_dbg;
+						#endif
 					}
 
 				#elif (LIGHT_DEBUG_MODE == 11)
 					// roughness value / port
 					{
+						#if #if LIGHT_ENABLE_FWD && LIGHT_USE_PHONG
 						float drough_dummy = 0.0f;
 						float r_dbg = roughness_value(rough_ptr, &drough_dummy);
 						dbg = r_dbg;
+						#endif
 					}
 
 				#elif (LIGHT_DEBUG_MODE == 12)
@@ -635,11 +639,14 @@ renderCUDA(
 			for (int ch = 0; ch < CHANNELS; ch++) {
 				const float albedo = features[collected_id[j] * CHANNELS + ch];
 
-				#if LIGHT_USE_PHONG
+				#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 				if (ch < 3)
 				{
 					C[ch] += albedo * w * ((&Lout.diffuse_mul_rgb.x)[ch]);
+
+					#if LIGHT_USE_PHONG
 					C[ch] += w * ((&Lout.spec_add_rgb.x)[ch]);
+					#endif
 				}
 				else
 				{
