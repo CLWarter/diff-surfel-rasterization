@@ -32,7 +32,13 @@ namespace BACKWARD
 		const float* transMats,
 		const float* colors,
 		const float* ambients,
+		const float* intensity,
+		const float* roughness,
+		const float* metallic,
 		const float* depths,
+		const float3* means3D_cam,
+		const float3* basis_u_cam,
+    	const float3* basis_v_cam,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
@@ -42,7 +48,10 @@ namespace BACKWARD
 		float* dL_dnormal3D,
 		float* dL_dopacity,
 		float* dL_dcolors,
-		float* dL_dambient);
+		float* dL_dambient,
+		float* dL_dintensity,
+		float* dL_droughness,
+		float* dL_dmetallic);
 
 	void preprocess(
 		int P, int D, int M,

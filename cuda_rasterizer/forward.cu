@@ -11,6 +11,7 @@
 
 #include "forward.h"
 #include "auxiliary.h"
+#include "lighting.cuh"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -82,12 +83,25 @@ __device__ void compute_transmat(
 	const int W,
 	const int H, 
 	glm::mat3 &T,
-	float3 &normal
+	float3 &normal,
+	float3& bu_cam,
+	float3& bv_cam
 ) {
-
 	glm::mat3 R = quat_to_rotmat(rot);
 	glm::mat3 S = scale_to_mat(scale, mod);
 	glm::mat3 L = R * S;
+
+	float3 p_view = transformPoint4x3(p_orig, viewmatrix);
+
+	bu_cam = transformVec4x3(
+		make_float3(L[0].x, L[0].y, L[0].z),
+		viewmatrix
+	);
+
+	bv_cam = transformVec4x3(
+		make_float3(L[1].x, L[1].y, L[1].z),
+		viewmatrix
+	);
 
 	// center of Gaussians in the camera coordinate
 	glm::mat3x4 splat2world = glm::mat3x4(
@@ -110,6 +124,7 @@ __device__ void compute_transmat(
 	);
 
 	T = glm::transpose(splat2world) * world2ndc * ndc2pix;
+
 	normal = transformVec4x3({L[2].x, L[2].y, L[2].z}, viewmatrix);
 
 }
@@ -165,6 +180,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	int* radii,
 	float2* points_xy_image,
 	float* depths,
+	float3* means3D_cam,
+	float3* basis_u_cam,
+    float3* basis_v_cam,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
@@ -189,9 +207,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Compute transformation matrix
 	glm::mat3 T;
 	float3 normal;
+	float3 bu_cam = make_float3(0.0f, 0.0f, 0.0f);
+	float3 bv_cam = make_float3(0.0f, 0.0f, 0.0f);
+
 	if (transMat_precomp == nullptr)
 	{
-		compute_transmat(((float3*)orig_points)[idx], scales[idx], scale_modifier, rotations[idx], projmatrix, viewmatrix, W, H, T, normal);
+		compute_transmat(((float3*)orig_points)[idx], scales[idx], scale_modifier, rotations[idx], projmatrix, viewmatrix, W, H, T, normal, bu_cam, bv_cam);
 		float3 *T_ptr = (float3*)transMats;
 		T_ptr[idx * 3 + 0] = {T[0][0], T[0][1], T[0][2]};
 		T_ptr[idx * 3 + 1] = {T[1][0], T[1][1], T[1][2]};
@@ -204,6 +225,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 			T_ptr[idx * 3 + 2]
 		);
 		normal = make_float3(0.0, 0.0, 1.0);
+
+		bu_cam = make_float3(0.0f, 0.0f, 0.0f);
+		bv_cam = make_float3(0.0f, 0.0f, 0.0f);
 	}
 
 #if DUAL_VISIABLE
@@ -244,6 +268,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	depths[idx] = p_view.z;
+	means3D_cam[idx] = p_view;
+	basis_u_cam[idx] = bu_cam;
+	basis_v_cam[idx] = bv_cam;
 	radii[idx] = (int)radius;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
@@ -251,36 +278,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
 }
 
 __device__ __forceinline__
-float3 compute_light_dir(const float2& pixf,
-                                   int W, int H,
-                                   float focal_x, float focal_y)
+void set_debug_gray(float C[3], float v)
 {
-    float x = (pixf.x - 0.5f * (float)W) / focal_x;
-    float y = (pixf.y - 0.5f * (float)H) / focal_y;
-    float3 v = make_float3(x, y, 1.0f);
-
-    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
-    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 1.f);
-
-    float inv_len = rsqrtf(len2);
-    v.x *= inv_len;
-    v.y *= inv_len;
-    v.z *= inv_len;
-    return v;
+    v = saturate01(v);
+    C[0] = v;
+    C[1] = v;
+    C[2] = v;
 }
-
-__device__ __forceinline__ float sigmoidf_stable(float x)
-{
-    // stable sigmoid to avoid exp overflow
-    if (x >= 0.0f) {
-        float z = expf(-x);
-        return 1.0f / (1.0f + z);
-    } else {
-        float z = expf(x);
-        return z / (1.0f + z);
-    }
-}
-
 
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
@@ -295,9 +299,15 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ ambients,
+	const float* __restrict__ intensity,
+	const float* __restrict__ roughness,
+	const float* __restrict__ metallic,
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
+	const float3* __restrict__ means3D_cam,
+	const float3* __restrict__ basis_u_cam,
+    const float3* __restrict__ basis_v_cam,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -330,6 +340,10 @@ renderCUDA(
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
+
+	__shared__ float3 collected_center_cam[BLOCK_SIZE];
+	__shared__ float3 collected_basis_u_cam[BLOCK_SIZE];
+	__shared__ float3 collected_basis_v_cam[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -370,6 +384,10 @@ renderCUDA(
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
+			
+			collected_center_cam[block.thread_rank()] = means3D_cam[coll_id];
+			collected_basis_u_cam[block.thread_rank()] = basis_u_cam[coll_id];
+    		collected_basis_v_cam[block.thread_rank()] = basis_v_cam[coll_id];
 		}
 		block.sync();
 
@@ -384,12 +402,18 @@ renderCUDA(
 			const float3 Tu = collected_Tu[j];
 			const float3 Tv = collected_Tv[j];
 			const float3 Tw = collected_Tw[j];
+
+			// NEW: Gaussian center in camera space for stable falloff
+			const float3 center_cam = collected_center_cam[j];
+			const float3 bu_cam = collected_basis_u_cam[j];
+			const float3 bv_cam = collected_basis_v_cam[j];
+
 			// Transform the two planes into local u-v system. 
 			float3 k = pix.x * Tw - Tu;
 			float3 l = pix.y * Tw - Tv;
 			// Cross product of two planes is a line, Eq. (9)
 			float3 p = cross(k, l);
-			if (p.z == 0.0) continue;
+			if (fabsf(p.z) < 1e-8f) continue;
 			// Perspective division to get the intersection (u,v), Eq. (10)
 			float2 s = {p.x / p.z, p.y / p.z};
 			float rho3d = (s.x * s.x + s.y * s.y); 
@@ -397,6 +421,12 @@ renderCUDA(
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
 			float rho = min(rho3d, rho2d);
+
+			float3 point_cam = make_float3(
+				center_cam.x + s.x * bu_cam.x + s.y * bv_cam.x,
+				center_cam.y + s.x * bu_cam.y + s.y * bv_cam.y,
+				center_cam.z + s.x * bu_cam.z + s.y * bv_cam.z
+			);
 
 			// compute depth
 			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
@@ -416,129 +446,56 @@ renderCUDA(
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, opa * exp(power));
-			if (alpha < 1.0f / 255.0f)
+			const float G = exp(power);
+			const float alpha = min(0.99f, opa * G);
+			if (alpha < LIGHT_ALPHA_SKIP_THRESHOLD)
 				continue;
+
 			float test_T = T * (1 - alpha);
-			if (test_T < 0.0001f)
-			{
-				done = true;
-				continue;
-			}
+
 			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
-			float diffuse_shading = 1.0f;   // multiplies base color
-			float spec_term       = 0.0f;   // additive (usually white)
-			float lambert         = 1.0f;
-			float specular        = 0.0f;
-			float ndotl           = 0.0f;
+			float w = alpha * T;
 
-			float ambient_raw = ambients[0]; // per-scene scalar
-			float ambient     = sigmoidf_stable(ambient_raw);
+			float w_indirect = 0.0f;
+			float w_direct   = w;    // compatibility if lighting disabled
 
-			float3 n = make_float3(normal[0], normal[1], normal[2]);
-			float3 L = make_float3(0,0,1);
-			float3 V = make_float3(0,0,1);
+            LightingOut Lout = {};
+            const float* rough_ptr = nullptr;
+			const float* metal_ptr = nullptr;
 
-			#if ENABLE_LAMBERT_SHADING || ENABLE_PHONG_SPECULAR
-				float len2 = n.x*n.x + n.y*n.y + n.z*n.z;
-				if (len2 > 1e-8f) {
-					float inv_n = rsqrtf(len2);
-					n.x *= inv_n; n.y *= inv_n; n.z *= inv_n;
-				} else {
-					n = make_float3(0.f, 0.f, 1.f);
+			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+			{
+				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
+				const int gid = collected_id[j];
+				rough_ptr = roughness + gid;
+				metal_ptr = metallic + gid;
+
+				float3 base_rgb = make_float3(
+                    features[collected_id[j] * CHANNELS + 0],
+					features[collected_id[j] * CHANNELS + 1],
+					features[collected_id[j] * CHANNELS + 2]
+                );
+
+                Lout = eval_lighting(
+                    pixf, W, H, focal_x, focal_y,
+                    n_raw, depth,
+                    ambients, intensity,
+                    rough_ptr, metal_ptr,
+                    base_rgb,
+                    &center_cam
+                );
+
+				w_indirect = w * Lout.indirect_diffuse;
+				w_direct   = w * Lout.direct_diffuse;
+
 				}
-
-				// light dir: camera -> surface
-				float3 light_dir = compute_light_dir(pixf, W, H, focal_x, focal_y);
-				// V turns the light dir to the surface -> camera
-				V = make_float3(-light_dir.x, -light_dir.y, -light_dir.z);
-
-			#if USE_HEADLIGHT
-				//L = make_float3(0.f, 0.f, 1.f); // -1 in z -> light_dir towards Camera
-				L = make_float3(0.f, 0.f, -1.f);
-			#else
-				L = V;
-			#endif
-
-				float l2 = L.x*L.x + L.y*L.y + L.z*L.z;
-				if (l2 > 1e-8f) { float inv = rsqrtf(l2); L.x*=inv; L.y*=inv; L.z*=inv; }
-
-			/*
-			// Spotlight direction: camera forward (so +Z) in camera space
-			const float3 spotDir = make_float3(0.f, 0.f, 1.f);
-
-			// cos angle between camera->surface and spotlight axis
-			float cosTheta = light_dir.x*spotDir.x + light_dir.y*spotDir.y + light_dir.z*spotDir.z;
-			
-			// cone angles (try to find one fitting the flashlight)
-			const float innerCos = 0.98; // about 11,5 degree 
-			const float outerCos = 0.92; // about 23,1 degree
-
-			// Smoothstep-ramp
-			float spot = 0.0f;
-			if (cosTheta >= innerCos) {
-				spot = 1.0f;
-			} else if (cosTheta <= outerCos) {
-				spot = 0.0f;
-			} else {
-				float t = (cosTheta - outerCos) / (innerCos - outerCos);
-				spot = t * t * (3.0f - 2.0f * t);
-			}
-			
-			// optional step: make it “tighter / stronger”
-			// spot = spot * spot; // uncomment to sharpen
-			*/
-
-			ndotl = n.x*L.x + n.y*L.y + n.z*L.z;
-
-			#if ENABLE_LAMBERT_SHADING
-			#   if USE_ABS_COS_SHADING
-					lambert = fabsf(ndotl);
-			#   else
-					lambert = fmaxf(ndotl, 0.0f);
-			#   endif
-			#else
-				lambert = 1.0f;
-			#endif
-
-			diffuse_shading = (ambient + (1.0f - ambient) * lambert); //* spot;
-
-			#if ENABLE_PHONG_SPECULAR
-				// H = normalize(L + V)
-				float3 H = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
-				float h2 = H.x*H.x + H.y*H.y + H.z*H.z;
-				if (h2 > 1e-8f) {
-					float invh = rsqrtf(h2);
-					H.x *= invh; H.y *= invh; H.z *= invh;
-
-					float ndoth = fmaxf(n.x*H.x + n.y*H.y + n.z*H.z, 0.0f);
-					specular = powf(ndoth, PHONG_SHININESS);
-				} else {
-					specular = 0.0f;
+				#else
+				{
+					// original no-lighting behavior
+					w_indirect = 0.0f;
+					w_direct   = w;
 				}
-				spec_term = PHONG_KS * specular; // * spot;
-				#endif
-			#else
-				lambert = 1.0f;
-				diffuse_shading = 1.0f;
-    			spec_term = 0.0f;
 			#endif
-
-			#if ENABLE_LAMBERT_SHADING
-			diffuse_shading *= (1.0f - PHONG_KS);  // light energy compensation
-			#endif
-			#if ENABLE_PHONG_SPECULAR
-			spec_term *= lambert;                 // make spec vanish at grazing/back-facing
-			#endif
-            // ---------------------------------------------------------------
-
-            float w       = alpha * T;
-
-			// diffuse: tinted
-			float w_diff = w * diffuse_shading;
-
-			// specular: additive (not tinted)
-			float w_spec = w * spec_term;
 
 #if RENDER_AXUTILITY
 			// Render depth distortion map
@@ -559,23 +516,157 @@ renderCUDA(
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
 #endif
 
-			// Eq. (3) from 3D Gaussian splatting paper.
-			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * w_diff;
+#if (LIGHT_DEBUG_MODE > 0)
+			{
+				float dbg = 0.0f;
 
-			// add spec to RGB only
-			#if ENABLE_PHONG_SPECULAR
-				if (CHANNELS >= 3) {
-					C[0] += w_spec;
-					C[1] += w_spec;
-					C[2] += w_spec;
+				// useful geometric helpers for debug visualization
+				const float dx_pc = point_cam.x - center_cam.x;
+				const float dy_pc = point_cam.y - center_cam.y;
+				const float dz_pc = point_cam.z - center_cam.z;
+				const float point_disp = sqrtf(dx_pc * dx_pc + dy_pc * dy_pc + dz_pc * dz_pc);
+
+				const float3 light_pos_dbg = make_float3(0.0f, 0.0f, 0.0f);
+				const float lx_dbg = point_cam.x - light_pos_dbg.x;
+				const float ly_dbg = point_cam.y - light_pos_dbg.y;
+				const float lz_dbg = point_cam.z - light_pos_dbg.z;
+				const float dist_dbg = sqrtf(lx_dbg * lx_dbg + ly_dbg * ly_dbg + lz_dbg * lz_dbg);
+
+				#if (LIGHT_DEBUG_MODE == 1)
+					// distance from chosen lighting point to light
+					dbg = 1.0f / (1.0f + dist_dbg);
+
+				#elif (LIGHT_DEBUG_MODE == 2)
+					// falloff inv only
+					dbg = Lout.inv / (1.0f + Lout.inv);
+
+				#elif (LIGHT_DEBUG_MODE == 3)
+					// final lighting intensity after I * inv
+					dbg = Lout.intensity / (1.0f + Lout.intensity);
+
+				#elif (LIGHT_DEBUG_MODE == 4)
+					// spotlight factor
+					dbg = Lout.spot * LIGHT_DEBUG_SCALE;
+
+				#elif (LIGHT_DEBUG_MODE == 6)
+					// displacement of point_cam from center_cam
+					dbg = point_disp / (0.1f + point_disp);
+
+				#elif (LIGHT_DEBUG_MODE == 7)
+					// raw normal visualization
+					C[0] = 0.5f * (normal[0] + 1.0f);
+					C[1] = 0.5f * (normal[1] + 1.0f);
+					C[2] = 0.5f * (normal[2] + 1.0f);
+
+				#elif (LIGHT_DEBUG_MODE == 8)
+					// learned ambient
+					dbg = Lout.ambient * LIGHT_DEBUG_SCALE;
+
+				#elif (LIGHT_DEBUG_MODE == 9)
+					// learned intensity value
+					{
+						float dI_dummy = 0.0f;
+						float I_dbg = intensity_value(intensity, &dI_dummy);
+						dbg = I_dbg / (1.0f + I_dbg);
+					}
+
+				#elif (LIGHT_DEBUG_MODE == 10)
+					// metallic value / port
+					{
+						#if #if LIGHT_ENABLE_FWD && LIGHT_USE_PHONG
+						float dmetal_dummy = 0.0f;
+						float m_dbg = metallic_value(metal_ptr, &dmetal_dummy);
+						dbg = m_dbg;
+						#endif
+					}
+
+				#elif (LIGHT_DEBUG_MODE == 11)
+					// roughness value / port
+					{
+						#if #if LIGHT_ENABLE_FWD && LIGHT_USE_PHONG
+						float drough_dummy = 0.0f;
+						float r_dbg = roughness_value(rough_ptr, &drough_dummy);
+						dbg = r_dbg;
+						#endif
+					}
+
+				#elif (LIGHT_DEBUG_MODE == 12)
+					// ndotl
+					dbg = 0.5f * (Lout.ndotl + 1.0f);
+
+				#elif (LIGHT_DEBUG_MODE == 13)
+					// lambert term
+					dbg = Lout.lambert * LIGHT_DEBUG_SCALE;
+
+				#elif (LIGHT_DEBUG_MODE == 14)
+					// RGB specular additive contribution shown as scalar proxy
+					dbg = Lout.spec_add / (1.0f + Lout.spec_add);
+
+				#elif (LIGHT_DEBUG_MODE == 15)
+					// chosen point depth
+					dbg = point_cam.z / (1.0f + point_cam.z);
+
+				#elif (LIGHT_DEBUG_MODE == 16)
+					// local alpha contribution
+					dbg = alpha * 32.0f;
+
+				#elif (LIGHT_DEBUG_MODE == 17)
+					// local compositing weight w = alpha * T
+					dbg = w * 32.0f;
+				#endif
+
+				#if (LIGHT_DEBUG_MODE != 5) && (LIGHT_DEBUG_MODE != 7)
+					dbg = saturate01(dbg);
+					C[0] = dbg;
+					C[1] = dbg;
+					C[2] = dbg;
+				#endif
+
+				// in debug mode, still advance compositing state so the viewer updates correctly
+				T = test_T;
+				last_contributor = contributor;
+                if (T < 0.0001f)
+                {
+                    done = true;
+                }
+				continue;
+			}
+#endif
+
+			// Diffuse
+			#pragma unroll
+			// Eq. (3) from 3D Gaussian splatting paper.
+			for (int ch = 0; ch < CHANNELS; ch++) {
+				const float albedo = features[collected_id[j] * CHANNELS + ch];
+
+				#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+				if (ch < 3)
+				{
+					C[ch] += albedo * w * ((&Lout.diffuse_mul_rgb.x)[ch]);
+
+					#if LIGHT_USE_PHONG
+					C[ch] += w * ((&Lout.spec_add_rgb.x)[ch]);
+					#endif
 				}
-			#endif
+				else
+				{
+					C[ch] += albedo * w_direct;
+				}
+				#else
+				C[ch] += albedo * w_direct;
+				#endif
+			}
+
 			T = test_T;
 
 			// Keep track of last range entry to update this
 			// pixel.
 			last_contributor = contributor;
+
+            if (T < 0.0001f)
+            {
+                done = true;
+            }
 		}
 	}
 
@@ -611,9 +702,15 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float* ambients,
+	const float* intensity,
+	const float* roughness,
+	const float* metallic,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
+	const float3* means3D_cam,
+	const float3* basis_u_cam,
+    const float3* basis_v_cam,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -628,9 +725,15 @@ void FORWARD::render(
 		means2D,
 		colors,
 		ambients,
+		intensity,
+		roughness,
+		metallic,
 		transMats,
 		depths,
 		normal_opacity,
+		means3D_cam,
+		basis_u_cam,
+		basis_v_cam,
 		final_T,
 		n_contrib,
 		bg_color,
@@ -657,6 +760,9 @@ void FORWARD::preprocess(int P, int D, int M,
 	int* radii,
 	float2* means2D,
 	float* depths,
+	float3* means3D_cam,
+	float3* basis_u_cam,
+    float3* basis_v_cam,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
@@ -684,6 +790,9 @@ void FORWARD::preprocess(int P, int D, int M,
 		radii,
 		means2D,
 		depths,
+		means3D_cam,
+		basis_u_cam,
+		basis_v_cam,
 		transMats,
 		rgb,
 		normal_opacity,
