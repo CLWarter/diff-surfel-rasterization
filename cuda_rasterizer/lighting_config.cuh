@@ -71,18 +71,18 @@
 // 0 = fixed LIGHT_PHONG_SHININESS define
 // 1 = learned per-scene shininess (scalar in [SHINY_MIN, SHINY_MAX])
 #ifndef LIGHT_PHONG_SHININESS_MODE
-#define LIGHT_PHONG_SHININESS_MODE 1
+#define LIGHT_PHONG_SHININESS_MODE 1 // unused
 #endif
 
 #define LIGHT_SHINY_MIN  2.0f
-#define LIGHT_SHINY_MAX  128.0f
+#define LIGHT_SHINY_MAX  128.0f // unused
 
 #ifndef LIGHT_PHONG_KS
-#define LIGHT_PHONG_KS 0.10f
+#define LIGHT_PHONG_KS 0.10f // unused
 #endif
 
 #ifndef LIGHT_PHONG_SHININESS
-#define LIGHT_PHONG_SHININESS 16.0f
+#define LIGHT_PHONG_SHININESS 16.0f // unused
 #endif
 
 // ------------------ GGX bridge settings ------------------
@@ -97,7 +97,7 @@
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS_MIN
-#define LIGHT_GGX_ROUGHNESS_MIN 0.04f
+#define LIGHT_GGX_ROUGHNESS_MIN 0.00f
 #endif
 
 #ifndef LIGHT_GGX_F0_DIELECTRIC
@@ -105,7 +105,7 @@
 #endif
 
 #ifndef LIGHT_GGX_METALLIC_MODE
-#define LIGHT_GGX_METALLIC_MODE 0   // 0 = fixed, 1 = later learnable
+#define LIGHT_GGX_METALLIC_MODE 1   // 0 = fixed, 1 = later learnable
 #endif
 
 #ifndef LIGHT_GGX_METALLIC
@@ -169,7 +169,7 @@
 // Hard clamp of Li = I * inv to prevent white splat spikes.
 // 0 to disable the clamp.
 #ifndef LIGHT_LI_CLAMP
-#define LIGHT_LI_CLAMP 1
+#define LIGHT_LI_CLAMP 0
 #endif
 
 // ------------------ Specular gating ------------------
@@ -191,7 +191,7 @@
 // 0 = off
 // 1 = on
 #ifndef LIGHT_USE_SPOT
-#define LIGHT_USE_SPOT 1
+#define LIGHT_USE_SPOT 0
 #endif
 
 // Spotlight params

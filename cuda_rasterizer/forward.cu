@@ -351,6 +351,14 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 
+#if (LIGHT_DEBUG_MODE > 0)
+	float dbg_best = 0.0f;
+	float dbg_best_w = 0.0f;
+
+	float dbg_sum = 0.0f;
+	float dbg_sum_w = 0.0f;
+#endif
+
 
 #if RENDER_AXUTILITY
 	// render axutility ouput
@@ -482,7 +490,7 @@ renderCUDA(
                     ambients, intensity,
                     rough_ptr, metal_ptr,
                     base_rgb,
-                    &center_cam
+                    &point_cam
                 );
 
 				w_indirect = w * Lout.indirect_diffuse;
@@ -571,24 +579,32 @@ renderCUDA(
 					}
 
 				#elif (LIGHT_DEBUG_MODE == 10)
-					// metallic value / port
+				{
+					if (metal_ptr != nullptr)
 					{
-						#if #if LIGHT_ENABLE_FWD && LIGHT_USE_PHONG
 						float dmetal_dummy = 0.0f;
 						float m_dbg = metallic_value(metal_ptr, &dmetal_dummy);
 						dbg = m_dbg;
-						#endif
 					}
+					else
+					{
+						dbg = 0.0f;
+					}
+				}
 
 				#elif (LIGHT_DEBUG_MODE == 11)
-					// roughness value / port
+				{
+					if (rough_ptr != nullptr)
 					{
-						#if #if LIGHT_ENABLE_FWD && LIGHT_USE_PHONG
 						float drough_dummy = 0.0f;
 						float r_dbg = roughness_value(rough_ptr, &drough_dummy);
 						dbg = r_dbg;
-						#endif
 					}
+					else
+					{
+						dbg = 0.0f;
+					}
+				}
 
 				#elif (LIGHT_DEBUG_MODE == 12)
 					// ndotl
@@ -615,11 +631,17 @@ renderCUDA(
 					dbg = w * 32.0f;
 				#endif
 
-				#if (LIGHT_DEBUG_MODE != 5) && (LIGHT_DEBUG_MODE != 7)
+				#if (LIGHT_DEBUG_MODE != 7)
 					dbg = saturate01(dbg);
-					C[0] = dbg;
-					C[1] = dbg;
-					C[2] = dbg;
+
+					if (w > dbg_best_w)
+					{
+						dbg_best_w = w;
+						dbg_best   = dbg;
+					}
+
+					dbg_sum   += w * dbg;
+					dbg_sum_w += w;
 				#endif
 
 				// in debug mode, still advance compositing state so the viewer updates correctly
@@ -670,14 +692,31 @@ renderCUDA(
 		}
 	}
 
+	#if (LIGHT_DEBUG_MODE > 0) && (LIGHT_DEBUG_MODE != 7)
+	if (inside)
+	{
+		float dbg_final = dbg_best;
+
+		C[0] = dbg_final;
+		C[1] = dbg_final;
+		C[2] = dbg_final;
+	}
+	#endif
+
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
 	if (inside)
 	{
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
+		#if (LIGHT_DEBUG_MODE > 0)
+		out_color[0 * H * W + pix_id] = C[0];
+		out_color[1 * H * W + pix_id] = C[1];
+		out_color[2 * H * W + pix_id] = C[2];
+		#else
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		#endif
 
 #if RENDER_AXUTILITY
 		n_contrib[pix_id + H * W] = median_contributor;
