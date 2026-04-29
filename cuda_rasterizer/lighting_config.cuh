@@ -93,7 +93,11 @@
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS
-#define LIGHT_GGX_ROUGHNESS 0.04f
+#define LIGHT_GGX_ROUGHNESS 0.15f
+#endif
+
+#ifndef LIGHT_GGX_ROUGHNESS_MAX
+#define LIGHT_GGX_ROUGHNESS_MAX 1.0f
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS_MIN
@@ -150,11 +154,15 @@
 #endif
 
 #ifndef FALLOFF_Z_GRAD_ENABLE
-#define FALLOFF_Z_GRAD_ENABLE 1
+#define FALLOFF_Z_GRAD_ENABLE 0
 #endif
 
 #ifndef FALLOFF_K
 #define FALLOFF_K 0.01f
+#endif
+
+#ifndef LIGHT_FALLOFF_EPS
+#define LIGHT_FALLOFF_EPS 1e-3f
 #endif
 
 #ifndef FALLOFF_Z_GRAD_SCALE

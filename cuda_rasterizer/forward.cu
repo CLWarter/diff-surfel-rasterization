@@ -578,32 +578,46 @@ renderCUDA(
 						dbg = I_dbg / (1.0f + I_dbg);
 					}
 
-				#elif (LIGHT_DEBUG_MODE == 10)
-				{
-					if (metal_ptr != nullptr)
-					{
+#elif (LIGHT_DEBUG_MODE == 10)
+{
+					const int gid_dbg = collected_id[j];
+
+					#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
+						if (metallic != nullptr)
+						{
+							float dmetal_dummy = 0.0f;
+							dbg = metallic_value(metallic + gid_dbg, &dmetal_dummy);
+						}
+						else
+						{
+							dbg = 0.0f;
+						}
+					#else
 						float dmetal_dummy = 0.0f;
-						float m_dbg = metallic_value(metal_ptr, &dmetal_dummy);
-						dbg = m_dbg;
-					}
-					else
-					{
-						dbg = 0.0f;
-					}
-				}
+						dbg = metallic_value(nullptr, &dmetal_dummy);
+					#endif
+}
 
 				#elif (LIGHT_DEBUG_MODE == 11)
 				{
-					if (rough_ptr != nullptr)
-					{
+					// Final per-contribution roughness value.
+					// Later blended by dbg_sum += w * dbg.
+					const int gid_dbg = collected_id[j];
+
+					#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
+						if (roughness != nullptr)
+						{
+							float drough_dummy = 0.0f;
+							dbg = roughness_value(roughness + gid_dbg, &drough_dummy);
+						}
+						else
+						{
+							dbg = 0.0f;
+						}
+					#else
 						float drough_dummy = 0.0f;
-						float r_dbg = roughness_value(rough_ptr, &drough_dummy);
-						dbg = r_dbg;
-					}
-					else
-					{
-						dbg = 0.0f;
-					}
+						dbg = roughness_value(nullptr, &drough_dummy);
+					#endif
 				}
 
 				#elif (LIGHT_DEBUG_MODE == 12)
@@ -634,14 +648,20 @@ renderCUDA(
 				#if (LIGHT_DEBUG_MODE != 7)
 					dbg = saturate01(dbg);
 
-					if (w > dbg_best_w)
+					#if (LIGHT_DEBUG_MODE == 10 || LIGHT_DEBUG_MODE == 11)
+						float dbg_w = alpha;   // material map: ignore transmittance dilution
+					#else
+						float dbg_w = w;       // lighting/debug maps: use real compositing weight
+					#endif
+
+					dbg_sum   += dbg_w * dbg;
+					dbg_sum_w += dbg_w;
+
+					if (dbg_w > dbg_best_w)
 					{
-						dbg_best_w = w;
+						dbg_best_w = dbg_w;
 						dbg_best   = dbg;
 					}
-
-					dbg_sum   += w * dbg;
-					dbg_sum_w += w;
 				#endif
 
 				// in debug mode, still advance compositing state so the viewer updates correctly
@@ -692,16 +712,20 @@ renderCUDA(
 		}
 	}
 
-	#if (LIGHT_DEBUG_MODE > 0) && (LIGHT_DEBUG_MODE != 7)
-	if (inside)
-	{
-		float dbg_final = dbg_best;
+#if (LIGHT_DEBUG_MODE > 0) && (LIGHT_DEBUG_MODE != 7)
+if (inside)
+{
+    float dbg_final = (dbg_sum_w > 1e-8f)
+        ? (dbg_sum / dbg_sum_w)
+        : dbg_best;
 
-		C[0] = dbg_final;
-		C[1] = dbg_final;
-		C[2] = dbg_final;
-	}
-	#endif
+    dbg_final = saturate01(dbg_final);
+
+    C[0] = dbg_final;
+    C[1] = dbg_final;
+    C[2] = dbg_final;
+}
+#endif
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.

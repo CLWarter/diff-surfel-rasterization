@@ -218,9 +218,8 @@ __device__ __forceinline__ float ambient_value(const float* __restrict__ ambient
     (void)ambients;
     return LIGHT_AMBIENT_FIXED;
 #else
-    const float amax = 0.25f;
     float t = sigmoidf_stable(ambients[0]);
-    return amax * t;
+    return t;
 #endif
 }
 
@@ -248,17 +247,31 @@ __device__ __forceinline__ float shininess_value(const float* metallic_raw, floa
 #endif
 }
 
-__device__ __forceinline__ float roughness_value(const float* roughness_raw, float* drough_draw_out)
+__device__ __forceinline__ float roughness_value(
+    const float* roughness_raw,
+    float* drough_draw_out)
 {
 #if (LIGHT_GGX_ROUGHNESS_MODE == 1)
     float t = sigmoidf_stable(roughness_raw[0]);
+
+    const float rmin = LIGHT_GGX_ROUGHNESS_MIN;
+    const float rmax = LIGHT_GGX_ROUGHNESS_MAX;
+    const float range = rmax - rmin;
+
     if (drough_draw_out)
-        *drough_draw_out = (1.0f - LIGHT_GGX_ROUGHNESS_MIN) * t * (1.0f - t);
-    return LIGHT_GGX_ROUGHNESS_MIN + (1.0f - LIGHT_GGX_ROUGHNESS_MIN) * t;
+        *drough_draw_out = range * t * (1.0f - t);
+
+    return rmin + range * t;
 #else
     (void)roughness_raw;
-    if (drough_draw_out) *drough_draw_out = 0.0f;
-    return fmaxf(LIGHT_GGX_ROUGHNESS, LIGHT_GGX_ROUGHNESS_MIN);
+
+    if (drough_draw_out)
+        *drough_draw_out = 0.0f;
+
+    return fminf(
+        fmaxf(LIGHT_GGX_ROUGHNESS, LIGHT_GGX_ROUGHNESS_MIN),
+        LIGHT_GGX_ROUGHNESS_MAX
+    );
 #endif
 }
 
