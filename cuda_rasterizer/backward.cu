@@ -475,7 +475,7 @@ renderCUDA(
 					const float common = (Lout.D * Lout.G) / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
 
 					const float dF0_dbase = Lout.metallic;
-					const float dspec_dbase = dF0_dbase * dF_dF0 * common * Lout.spot * Lout.Li;
+					const float dspec_dbase = dF0_dbase * dF_dF0 * common * Lout.lambert * Lout.spot * Lout.Li;
 
 					atomicAdd(&(dL_dcolors[global_id * C + 0]), dL_dspec_rgb.x * dspec_dbase);
 					atomicAdd(&(dL_dcolors[global_id * C + 1]), dL_dspec_rgb.y * dspec_dbase);
@@ -585,9 +585,9 @@ renderCUDA(
 
 					// spec scalar proxy = avg(F_rgb) * D * G / (4 nv nl)
 					const float3 dspec_da2_rgb = make_float3(
-						(Lout.fresnel_rgb.x * Lout.G / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * dD_da2 * Lout.spot * Lout.Li,
-						(Lout.fresnel_rgb.y * Lout.G / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * dD_da2 * Lout.spot * Lout.Li,
-						(Lout.fresnel_rgb.z * Lout.G / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * dD_da2 * Lout.spot * Lout.Li
+						(Lout.fresnel_rgb.x * Lout.G / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * dD_da2 * Lout.lambert * Lout.spot * Lout.Li,
+						(Lout.fresnel_rgb.y * Lout.G / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * dD_da2 * Lout.lambert * Lout.spot * Lout.Li,
+						(Lout.fresnel_rgb.z * Lout.G / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * dD_da2 * Lout.lambert * Lout.spot * Lout.Li
 					);
 
 					// alpha2 = roughness^4  => d(alpha2)/d(roughness) = 4 r^3
@@ -621,9 +621,9 @@ renderCUDA(
 					const float dG_dr  = dGv_dr * Lout.Gl + Lout.Gv * dGl_dr;
 
 					const float3 dspec_dG_rgb = make_float3(
-						(Lout.fresnel_rgb.x * Lout.D / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * Lout.spot * Lout.Li,
-						(Lout.fresnel_rgb.y * Lout.D / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * Lout.spot * Lout.Li,
-						(Lout.fresnel_rgb.z * Lout.D / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * Lout.spot * Lout.Li
+						(Lout.fresnel_rgb.x * Lout.D / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * Lout.lambert * Lout.spot * Lout.Li,
+						(Lout.fresnel_rgb.y * Lout.D / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * Lout.lambert * Lout.spot * Lout.Li,
+						(Lout.fresnel_rgb.z * Lout.D / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * Lout.lambert * Lout.spot * Lout.Li
 					);
 
 					const float3 dspec_dr_from_G_rgb = make_float3(
@@ -674,10 +674,12 @@ renderCUDA(
 						-(1.0f - Lout.fresnel_rgb.z) - (1.0f - Lout.metallic) * dF_dm.z
 					);
 
+					const float diffuse_light = Lout.indirect_diffuse + Lout.direct_diffuse_raw;
+
 					const float3 dDiffuse_dm_rgb = make_float3(
-						Lout.direct_diffuse_raw * dkd_dm.x,
-						Lout.direct_diffuse_raw * dkd_dm.y,
-						Lout.direct_diffuse_raw * dkd_dm.z
+						diffuse_light * dkd_dm.x,
+						diffuse_light * dkd_dm.y,
+						diffuse_light * dkd_dm.z
 					);
 
 					dL_dm += dL_ddiffuse_rgb.x * dDiffuse_dm_rgb.x;
@@ -691,10 +693,16 @@ renderCUDA(
 					Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
 				{
 					// F0_rgb = 0.04*(1-m) + base_rgb*m  => dF0/dm = base_rgb - 0.04
+					const float3 base_f0 = make_float3(
+						saturate01(base_rgb.x),
+						saturate01(base_rgb.y),
+						saturate01(base_rgb.z)
+					);
+
 					const float3 dF0_dm = make_float3(
-						base_rgb.x - LIGHT_GGX_F0_DIELECTRIC,
-						base_rgb.y - LIGHT_GGX_F0_DIELECTRIC,
-						base_rgb.z - LIGHT_GGX_F0_DIELECTRIC
+						base_f0.x - LIGHT_GGX_F0_DIELECTRIC,
+						base_f0.y - LIGHT_GGX_F0_DIELECTRIC,
+						base_f0.z - LIGHT_GGX_F0_DIELECTRIC
 					);
 
 					// F = F0 + (1-F0)(1-vh)^5 = F0*(1-k) + k, so dF/dF0 = 1 - (1-vh)^5
@@ -707,9 +715,9 @@ renderCUDA(
 					const float nl = fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS);
 					const float common = (Lout.D * Lout.G) / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
 
-					const float dspec_dm_r = dF0_dm.x * dF_dF0 * common * Lout.spot * Lout.Li;
-					const float dspec_dm_g = dF0_dm.y * dF_dF0 * common * Lout.spot * Lout.Li;
-					const float dspec_dm_b = dF0_dm.z * dF_dF0 * common * Lout.spot * Lout.Li;
+					const float dspec_dm_r = dF0_dm.x * dF_dF0 * common * Lout.lambert * Lout.spot * Lout.Li;
+					const float dspec_dm_g = dF0_dm.y * dF_dF0 * common * Lout.lambert * Lout.spot * Lout.Li;
+					const float dspec_dm_b = dF0_dm.z * dF_dF0 * common * Lout.lambert * Lout.spot * Lout.Li;
 
 					dL_dm += dL_dspec_rgb.x * dspec_dm_r;
 					dL_dm += dL_dspec_rgb.y * dspec_dm_g;

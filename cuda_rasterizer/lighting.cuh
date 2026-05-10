@@ -993,14 +993,20 @@ o.intensity = Li;
     o.metallic = metallic;
     o.dmetal_raw = dmetal_draw;
 
-    // scalar proxy stays for compatibility
-    o.F0 = LIGHT_GGX_F0_DIELECTRIC * (1.0f - metallic) + float3_avg(base_color) * metallic;
+    // Make color stay in [0, 1] so F0 stays valid
+    float3 base_clamped = make_float3(
+        saturate01(base_color.x),
+        saturate01(base_color.y),
+        saturate01(base_color.z)
+    );
 
     o.F0_rgb = make_float3(
-        LIGHT_GGX_F0_DIELECTRIC * (1.0f - metallic) + base_color.x * metallic,
-        LIGHT_GGX_F0_DIELECTRIC * (1.0f - metallic) + base_color.y * metallic,
-        LIGHT_GGX_F0_DIELECTRIC * (1.0f - metallic) + base_color.z * metallic
+        LIGHT_GGX_F0_DIELECTRIC * (1.0f - metallic) + base_clamped.x * metallic,
+        LIGHT_GGX_F0_DIELECTRIC * (1.0f - metallic) + base_clamped.y * metallic,
+        LIGHT_GGX_F0_DIELECTRIC * (1.0f - metallic) + base_clamped.z * metallic
     );
+
+    o.F0 = float3_avg(o.F0_rgb);
 #endif
 
 // diffuse decomposition
@@ -1070,13 +1076,12 @@ o.intensity = Li;
         spec_brdf_scalar = float3_avg(spec_brdf_rgb);
     }
 
-    float3 spec_dir_raw_rgb = float3_scale(spec_brdf_rgb, spot * Li);
+    float3 spec_dir_raw_rgb = float3_scale(spec_brdf_rgb, lambert * spot * Li);
     float3 spec_dir_gated_rgb = spec_dir_raw_rgb;
 
     #if (LIGHT_SPEC_GATING == 1)
-        if (ndotl <= 0.0f) spec_dir_gated_rgb = make_float3(0.0f, 0.0f, 0.0f);
-    #elif (LIGHT_SPEC_GATING == 2)
-        spec_dir_gated_rgb = float3_scale(spec_dir_gated_rgb, lambert);
+        if (ndotl <= 0.0f || o.ndotv <= 0.0f)
+            spec_dir_gated_rgb = make_float3(0.0f, 0.0f, 0.0f);
     #endif
 
     o.D           = D;
@@ -1127,11 +1132,13 @@ o.intensity = Li;
         // ---------------- renderer shading decomposition ----------------
         // This is NOT part of the BRDF:
         // ambient is only an approximate indirect irradiance scalar.
-        o.indirect_approx_rgb = make_float3(
-            o.indirect_diffuse,
-            o.indirect_diffuse,
-            o.indirect_diffuse
+        float3 indirect_diffuse_rgb = make_float3(
+            o.indirect_diffuse * kd_rgb.x,
+            o.indirect_diffuse * kd_rgb.y,
+            o.indirect_diffuse * kd_rgb.z
         );
+
+        o.indirect_approx_rgb = indirect_diffuse_rgb;
 
         o.direct_diffuse_rgb = make_float3(
             o.direct_diffuse_raw * kd_rgb.x,
@@ -1142,9 +1149,9 @@ o.intensity = Li;
         // Final diffuse shading multiplier used on base color:
         // base_color * (indirect_approx + direct_diffuse)
         o.diffuse_mul_rgb = make_float3(
-            o.indirect_approx_rgb.x + o.direct_diffuse_rgb.x,
-            o.indirect_approx_rgb.y + o.direct_diffuse_rgb.y,
-            o.indirect_approx_rgb.z + o.direct_diffuse_rgb.z
+            indirect_diffuse_rgb.x + o.direct_diffuse_rgb.x,
+            indirect_diffuse_rgb.y + o.direct_diffuse_rgb.y,
+            indirect_diffuse_rgb.z + o.direct_diffuse_rgb.z
         );
 
         // legacy scalar proxies kept for older paths / debug
