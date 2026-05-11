@@ -370,6 +370,9 @@ renderCUDA(
 	float median_depth = {0};
 	// float median_weight = {0};
 	float median_contributor = {-1};
+	float metallic_sum = 0.0f;
+	float roughness_sum = 0.0f;
+	float material_sum_w = 0.0f;
 
 #endif
 
@@ -458,6 +461,35 @@ renderCUDA(
 			const float alpha = min(0.99f, opa * G);
 			if (alpha < LIGHT_ALPHA_SKIP_THRESHOLD)
 				continue;
+
+			{
+				const int gid_mat = collected_id[j];
+
+				float dmetal_dummy = 0.0f;
+				float drough_dummy = 0.0f;
+
+				float m_val = 0.0f;
+				float r_val = 0.0f;
+
+				#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
+					if (metallic != nullptr)
+						m_val = metallic_value(metallic + gid_mat, &dmetal_dummy);
+					if (roughness != nullptr)
+						r_val = roughness_value(roughness + gid_mat, &drough_dummy);
+				#else
+					m_val = metallic_value(nullptr, &dmetal_dummy);
+					r_val = roughness_value(nullptr, &drough_dummy);
+				#endif
+
+				m_val = saturate01(m_val);
+				r_val = saturate01(r_val);
+
+				float material_w = alpha;
+
+				metallic_sum += material_w * m_val;
+				roughness_sum += material_w * r_val;
+				material_sum_w += material_w;
+			}
 
 			float test_T = T * (1 - alpha);
 
@@ -578,8 +610,8 @@ renderCUDA(
 						dbg = I_dbg / (1.0f + I_dbg);
 					}
 
-#elif (LIGHT_DEBUG_MODE == 10)
-{
+				#elif (LIGHT_DEBUG_MODE == 10)
+				{
 					const int gid_dbg = collected_id[j];
 
 					#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
@@ -596,7 +628,7 @@ renderCUDA(
 						float dmetal_dummy = 0.0f;
 						dbg = metallic_value(nullptr, &dmetal_dummy);
 					#endif
-}
+				}
 
 				#elif (LIGHT_DEBUG_MODE == 11)
 				{
@@ -721,11 +753,52 @@ if (inside)
 
     dbg_final = saturate01(dbg_final);
 
-    C[0] = dbg_final;
-    C[1] = dbg_final;
-    C[2] = dbg_final;
+    #if (LIGHT_DEBUG_MODE == 10 || LIGHT_DEBUG_MODE == 11)
+        dbg_final = floorf(dbg_final * 10.0f + 0.5f) / 10.0f;
+
+		// approximate value bands:
+		// 0.0 black
+		// 0.1 blue
+		// 0.2 cyan
+		// 0.3 green
+		// 0.4 yellow-green
+		// 0.5 yellow
+		// 0.6 orange
+		// 0.7 red-orange
+		// 0.8 red
+		// 0.9 magenta
+		// 1.0 white
+        if      (dbg_final < 0.05f) { C[0]=0.0f; C[1]=0.0f; C[2]=0.0f; } // 0.0
+        else if (dbg_final < 0.15f) { C[0]=0.0f; C[1]=0.0f; C[2]=1.0f; } // 0.1
+        else if (dbg_final < 0.25f) { C[0]=0.0f; C[1]=1.0f; C[2]=1.0f; } // 0.2
+        else if (dbg_final < 0.35f) { C[0]=0.0f; C[1]=1.0f; C[2]=0.0f; } // 0.3
+        else if (dbg_final < 0.45f) { C[0]=0.5f; C[1]=1.0f; C[2]=0.0f; } // 0.4
+        else if (dbg_final < 0.55f) { C[0]=1.0f; C[1]=1.0f; C[2]=0.0f; } // 0.5
+        else if (dbg_final < 0.65f) { C[0]=1.0f; C[1]=0.5f; C[2]=0.0f; } // 0.6
+        else if (dbg_final < 0.75f) { C[0]=1.0f; C[1]=0.25f; C[2]=0.0f; } // 0.7
+        else if (dbg_final < 0.85f) { C[0]=1.0f; C[1]=0.0f; C[2]=0.0f; } // 0.8
+        else if (dbg_final < 0.95f) { C[0]=1.0f; C[1]=0.0f; C[2]=1.0f; } // 0.9
+        else                        { C[0]=1.0f; C[1]=1.0f; C[2]=1.0f; } // 1.0
+
+    #else
+        C[0] = dbg_final;
+        C[1] = dbg_final;
+        C[2] = dbg_final;
+    #endif
 }
 #endif
+
+	float metallic_final = 0.0f;
+	float roughness_final = 0.0f;
+
+	if (material_sum_w > 1e-8f)
+	{
+		metallic_final = metallic_sum / material_sum_w;
+		roughness_final = roughness_sum / material_sum_w;
+	}
+
+	metallic_final = saturate01(metallic_final);
+	roughness_final = saturate01(roughness_final);
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
@@ -751,6 +824,8 @@ if (inside)
 		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
+		out_others[pix_id + METALLIC_OFFSET * H * W] = metallic_final;
+		out_others[pix_id + ROUGHNESS_OFFSET * H * W] = roughness_final;
 		// out_others[pix_id + MEDIAN_WEIGHT_OFFSET * H * W] = median_weight;
 #endif
 	}
