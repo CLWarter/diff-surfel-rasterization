@@ -565,9 +565,6 @@ renderCUDA(
 #if RENDER_AXUTILITY
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
-			float A = 1-T;
-			float m = far_n / (far_n - near_n) * (1 - near_n / depth);
-			distortion += (m * m * A + M2 - 2 * m * M1) * w;
 			if (depth_valid)
 			{
 				float A = 1 - T;
@@ -651,7 +648,7 @@ renderCUDA(
 				{
 					const int gid_dbg = collected_id[j];
 
-					#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
+					#if (LIGHT_GGX_METALLIC_MODE == 1)
 						if (metallic != nullptr)
 						{
 							float dmetal_dummy = 0.0f;

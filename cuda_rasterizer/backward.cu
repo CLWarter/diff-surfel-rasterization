@@ -574,9 +574,8 @@ renderCUDA(
 			{
 				float d_diffuse_da = 1.0f;
 
-				const float amax = 0.25f;
 				float t = sigmoidf_stable(ambients[0]);
-				float da_draw = amax * t * (1.0f - t);
+				float da_draw = t * (1.0f - t);
 
 				dAmb += dL_dindirect_approx  * d_diffuse_da * da_draw;
 			}
@@ -1035,43 +1034,47 @@ renderCUDA(
 
         float dL_dweight = 0;
 
-#if RENDER_AXUTILITY
-			const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
-			const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * c_d * c_d);
-			if (contributor == median_contributor-1) {
-				dL_dz += dL_dmedian_depth;
-				// dL_dweight += dL_dmax_dweight;
+			#if RENDER_AXUTILITY
+			if (depth_valid)
+			{
+				const float m_d = far_n / (far_n - near_n) * (1.0f - near_n / c_d);
+				const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * c_d * c_d);
+
+				if (contributor == median_contributor - 1)
+				{
+					dL_dz += dL_dmedian_depth;
+				}
+
+			#if DETACH_WEIGHT
+				dL_dweight += 0.0f;
+			#else
+				dL_dweight += (final_D2 + m_d * m_d * final_A - 2.0f * m_d * final_D) * dL_dreg;
+			#endif
+
+				dL_dalpha += dL_dweight - last_dL_dT;
+				last_dL_dT = dL_dweight * alpha + (1.0f - alpha) * last_dL_dT;
+
+				const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
+				dL_dz += dL_dmd * dmd_dd;
+
+				accum_depth_rec = last_alpha * last_depth + (1.0f - last_alpha) * accum_depth_rec;
+				last_depth = c_d;
+				dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
+
+				accum_alpha_rec = last_alpha * 1.0f + (1.0f - last_alpha) * accum_alpha_rec;
+				dL_dalpha += (1.0f - accum_alpha_rec) * dL_daccum;
+
+				for (int ch = 0; ch < 3; ch++)
+				{
+					accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.0f - last_alpha) * accum_normal_rec[ch];
+					last_normal[ch] = normal[ch];
+					dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
+					atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
+				}
+
+				dL_dz += alpha * T * dL_ddepth;
 			}
-#if DETACH_WEIGHT 
-			// if not detached weight, sometimes 
-			// it will bia toward creating extragated 2D Gaussians near front
-			dL_dweight += 0;
-#else
-			dL_dweight += (final_D2 + m_d * m_d * final_A - 2 * m_d * final_D) * dL_dreg;
-#endif
-			dL_dalpha += dL_dweight - last_dL_dT;
-			// propagate the current weight W_{i} to next weight W_{i-1}
-			last_dL_dT = dL_dweight * alpha + (1 - alpha) * last_dL_dT;
-			const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
-			dL_dz += dL_dmd * dmd_dd;
-
-			// Propagate gradients w.r.t ray-splat depths
-			accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
-			last_depth = c_d;
-			dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
-			// Propagate gradients w.r.t. color ray-splat alphas
-			accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
-			dL_dalpha += (1 - accum_alpha_rec) * dL_daccum;
-
-			// Propagate gradients to per-Gaussian normals
-			for (int ch = 0; ch < 3; ch++) {
-				accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
-				last_normal[ch] = normal[ch];
-				dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
-				atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
-			}
-#endif
-
+			#endif
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
@@ -1086,9 +1089,6 @@ renderCUDA(
 
 			// Helpful reusable temporary variables
 			const float dL_dG = nor_o.w * dL_dalpha;
-#if RENDER_AXUTILITY
-			dL_dz += alpha * T * dL_ddepth; 
-#endif
 
 			if (use_3d_footprint) {
 				// Update gradients w.r.t. covariance of Gaussian 3x3 (T)
