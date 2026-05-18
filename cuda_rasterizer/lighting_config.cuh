@@ -154,7 +154,7 @@
 #endif
 
 #ifndef FALLOFF_Z_GRAD_ENABLE
-#define FALLOFF_Z_GRAD_ENABLE 0
+#define FALLOFF_Z_GRAD_ENABLE 1
 #endif
 
 #ifndef FALLOFF_K
@@ -254,4 +254,8 @@
 // Comes from original 2DGS code itself
 #ifndef LIGHT_ALPHA_SKIP_THRESHOLD
 #define LIGHT_ALPHA_SKIP_THRESHOLD (1.0f / 255.0f)
+#endif
+
+#ifndef LIGHT_DEPTH_DISCARD_2D_FALLBACK
+#define LIGHT_DEPTH_DISCARD_2D_FALLBACK 0
 #endif

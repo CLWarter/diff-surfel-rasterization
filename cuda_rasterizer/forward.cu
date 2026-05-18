@@ -359,7 +359,10 @@ renderCUDA(
 	float dbg_sum_w = 0.0f;
 #endif
 
-
+	float metallic_sum = 0.0f;
+	float roughness_sum = 0.0f;
+	float material_sum_w = 0.0f;
+	
 #if RENDER_AXUTILITY
 	// render axutility ouput
 	float N[3] = {0};
@@ -370,9 +373,6 @@ renderCUDA(
 	float median_depth = {0};
 	// float median_weight = {0};
 	float median_contributor = {-1};
-	float metallic_sum = 0.0f;
-	float roughness_sum = 0.0f;
-	float material_sum_w = 0.0f;
 
 #endif
 
@@ -426,24 +426,43 @@ renderCUDA(
 			float3 p = cross(k, l);
 			if (fabsf(p.z) < 1e-8f) continue;
 			// Perspective division to get the intersection (u,v), Eq. (10)
-			float2 s = {p.x / p.z, p.y / p.z};
+						float2 s = {p.x / p.z, p.y / p.z};
 			float rho3d = (s.x * s.x + s.y * s.y); 
+
 			// Add low pass filter
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
+
+			const bool use_3d_footprint = (rho3d <= rho2d);
 			float rho = min(rho3d, rho2d);
 
+			// 3D surfel hit point in camera space.
+			// Only reliable when the 3D footprint wins over the 2D low-pass fallback.
 			float3 point_cam = make_float3(
 				center_cam.x + s.x * bu_cam.x + s.y * bv_cam.x,
 				center_cam.y + s.x * bu_cam.y + s.y * bv_cam.y,
 				center_cam.z + s.x * bu_cam.z + s.y * bv_cam.z
 			);
 
-			// compute depth
+			// Per-pixel surfel depth: Tw * [u, v, 1].
+			// If the 2D low-pass filter wins, fall back to center depth.
 			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
-			// if a point is too small, its depth is not reliable?
-			// depth = (rho3d <= rho2d) ? depth : Tw.z 
-			if (depth < near_n) continue;
+			bool depth_valid = true;
+
+			if (!use_3d_footprint)
+			{
+				point_cam = center_cam;
+
+				#if LIGHT_DEPTH_DISCARD_2D_FALLBACK
+					depth_valid = false;
+					depth = Tw.z; // keep harmless fallback for lighting/debug if needed
+				#else
+					depth = Tw.z;
+				#endif
+			}
+
+			if (depth_valid && depth < near_n)
+				continue;
 
 			float4 nor_o = collected_normal_opacity[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
@@ -462,6 +481,11 @@ renderCUDA(
 			if (alpha < LIGHT_ALPHA_SKIP_THRESHOLD)
 				continue;
 
+			float test_T = T * (1 - alpha);
+
+			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
+			float w = alpha * T;
+
 			{
 				const int gid_mat = collected_id[j];
 
@@ -469,32 +493,33 @@ renderCUDA(
 				float drough_dummy = 0.0f;
 
 				float m_val = 0.0f;
-				float r_val = 0.0f;
+				float r_val = 0.5f;
 
-				#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
+				#if (LIGHT_GGX_METALLIC_MODE == 1)
 					if (metallic != nullptr)
 						m_val = metallic_value(metallic + gid_mat, &dmetal_dummy);
+				#else
+					m_val = metallic_value(nullptr, &dmetal_dummy);
+				#endif
+
+				#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
 					if (roughness != nullptr)
 						r_val = roughness_value(roughness + gid_mat, &drough_dummy);
 				#else
-					m_val = metallic_value(nullptr, &dmetal_dummy);
 					r_val = roughness_value(nullptr, &drough_dummy);
 				#endif
 
 				m_val = saturate01(m_val);
 				r_val = saturate01(r_val);
 
-				float material_w = alpha;
+				// Correct visible contribution weight.
+				// alpha alone ignores occlusion; alpha*T matches color compositing.
+				const float material_w = w;
 
-				metallic_sum += material_w * m_val;
-				roughness_sum += material_w * r_val;
-				material_sum_w += material_w;
+				metallic_sum    += material_w * m_val;
+				roughness_sum   += material_w * r_val;
+				material_sum_w  += material_w;
 			}
-
-			float test_T = T * (1 - alpha);
-
-			// ================= LAMBERT + PHONG SHADING (FORWARD) ======================
-			float w = alpha * T;
 
 			float w_indirect = 0.0f;
 			float w_direct   = w;    // compatibility if lighting disabled
@@ -543,17 +568,29 @@ renderCUDA(
 			float A = 1-T;
 			float m = far_n / (far_n - near_n) * (1 - near_n / depth);
 			distortion += (m * m * A + M2 - 2 * m * M1) * w;
-			D  += depth * w;
-			M1 += m * w;
-			M2 += m * m * w;
+			if (depth_valid)
+			{
+				float A = 1 - T;
+				float m = far_n / (far_n - near_n) * (1 - near_n / depth);
 
-			if (T > 0.5) {
-				median_depth = depth;
-				// median_weight = w;
-				median_contributor = contributor;
+				distortion += (m * m * A + M2 - 2 * m * M1) * w;
+				D  += depth * w;
+				M1 += m * w;
+				M2 += m * m * w;
+
+				if (T > 0.5f)
+				{
+					median_depth = depth;
+					// median_weight = w;
+					median_contributor = contributor;
+				}
 			}
+
 			// Render normal map
-			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
+			if (depth_valid)
+			{
+				for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
+			}
 #endif
 
 #if (LIGHT_DEBUG_MODE > 0)
@@ -789,11 +826,13 @@ if (inside)
 #endif
 
 	float metallic_final = 0.0f;
-	float roughness_final = 0.0f;
+	float roughness_final = 0.5f;
 
-	if (material_sum_w > 1e-8f)
+	const float final_alpha = 1.0f - T;
+
+	if (material_sum_w > 1e-8f && final_alpha > 1e-4f)
 	{
-		metallic_final = metallic_sum / material_sum_w;
+		metallic_final  = metallic_sum  / material_sum_w;
 		roughness_final = roughness_sum / material_sum_w;
 	}
 

@@ -320,23 +320,42 @@ renderCUDA(
 			float3 l = pix.y * Tw - Tv;
 			float3 p = cross(k, l);
 			if (fabsf(p.z) < 1e-8f) continue;
-			float2 s = {p.x / p.z, p.y / p.z};
+						float2 s = {p.x / p.z, p.y / p.z};
 			float rho3d = (s.x * s.x + s.y * s.y); 
+
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
+
+			const bool use_3d_footprint = (rho3d <= rho2d);
 			float rho = min(rho3d, rho2d);
 
+			// 3D surfel hit point in camera space.
+			// Only reliable when the 3D footprint wins over the 2D low-pass fallback.
 			float3 point_cam = make_float3(
 				center_cam.x + s.x * bu_cam.x + s.y * bv_cam.x,
 				center_cam.y + s.x * bu_cam.y + s.y * bv_cam.y,
 				center_cam.z + s.x * bu_cam.z + s.y * bv_cam.z
 			);
 
-			// compute depth
-			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]
-			// if a point is too small, its depth is not reliable?
-			// c_d = (rho3d <= rho2d) ? c_d : Tw.z; 
-			if (c_d < near_n) continue;
+			// Per-pixel surfel depth: Tw * [u, v, 1].
+			// If the 2D low-pass filter wins, fall back to center depth.
+			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
+			bool depth_valid = true;
+
+			if (!use_3d_footprint)
+			{
+				point_cam = center_cam;
+
+				#if LIGHT_DEPTH_DISCARD_2D_FALLBACK
+					depth_valid = false;
+					c_d = Tw.z; // keep harmless fallback for lighting/debug if needed
+				#else
+					c_d = Tw.z;
+				#endif
+			}
+
+			if (depth_valid && c_d < near_n)
+    			continue;
 			
 			float4 nor_o = collected_normal_opacity[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
@@ -1071,7 +1090,7 @@ renderCUDA(
 			dL_dz += alpha * T * dL_ddepth; 
 #endif
 
-			if (rho3d <= rho2d) {
+			if (use_3d_footprint) {
 				// Update gradients w.r.t. covariance of Gaussian 3x3 (T)
 				float2 dL_ds = {
 					dL_dG * -G * s.x + dL_dz * Tw.x,

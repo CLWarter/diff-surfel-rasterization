@@ -59,6 +59,40 @@ static std::string lighting_build_info_string() {
     ss << "LIGHT_SPOT_OUTER_DEG=" << STR(LIGHT_SPOT_OUTER_DEG) << "\n";
     ss << "LIGHT_SPOT_EXP=" << STR(LIGHT_SPOT_EXP) << "\n";
 
+    // GGX
+    ss << "LIGHT_GGX_ROUGHNESS_MODE=" << STR(LIGHT_GGX_ROUGHNESS_MODE) << "\n";
+    ss << "LIGHT_GGX_ROUGHNESS=" << STR(LIGHT_GGX_ROUGHNESS) << "\n";
+    ss << "LIGHT_GGX_ROUGHNESS_MIN=" << STR(LIGHT_GGX_ROUGHNESS_MIN) << "\n";
+    ss << "LIGHT_GGX_ROUGHNESS_MAX=" << STR(LIGHT_GGX_ROUGHNESS_MAX) << "\n";
+    ss << "LIGHT_GGX_F0_DIELECTRIC=" << STR(LIGHT_GGX_F0_DIELECTRIC) << "\n";
+
+    ss << "LIGHT_GGX_METALLIC_MODE=" << STR(LIGHT_GGX_METALLIC_MODE) << "\n";
+    ss << "LIGHT_GGX_METALLIC=" << STR(LIGHT_GGX_METALLIC) << "\n";
+    ss << "LIGHT_GGX_METALLIC_MIN=" << STR(LIGHT_GGX_METALLIC_MIN) << "\n";
+    ss << "LIGHT_GGX_METALLIC_MAX=" << STR(LIGHT_GGX_METALLIC_MAX) << "\n";
+
+    ss << "LIGHT_GGX_NV_EPS=" << STR(LIGHT_GGX_NV_EPS) << "\n";
+    ss << "LIGHT_GGX_NL_EPS=" << STR(LIGHT_GGX_NL_EPS) << "\n";
+    ss << "LIGHT_GGX_DENOM_EPS=" << STR(LIGHT_GGX_DENOM_EPS) << "\n";
+
+    // Intensity
+    ss << "LIGHT_INTENSITY_MODE=" << STR(LIGHT_INTENSITY_MODE) << "\n";
+    ss << "LIGHT_INTENSITY_CONST=" << STR(LIGHT_INTENSITY_CONST) << "\n";
+
+    // Falloff extras
+    ss << "FALLOFF_Z_GRAD_ENABLE=" << STR(FALLOFF_Z_GRAD_ENABLE) << "\n";
+    ss << "LIGHT_FALLOFF_EPS=" << STR(LIGHT_FALLOFF_EPS) << "\n";
+
+    // Safety clamps
+    ss << "LIGHT_LI_CLAMP=" << STR(LIGHT_LI_CLAMP) << "\n";
+
+    // Debug
+    ss << "LIGHT_DEBUG_MODE=" << STR(LIGHT_DEBUG_MODE) << "\n";
+    ss << "LIGHT_DEBUG_SCALE=" << STR(LIGHT_DEBUG_SCALE) << "\n";
+
+    // Alpha skip
+    ss << "LIGHT_ALPHA_SKIP_THRESHOLD=" << STR(LIGHT_ALPHA_SKIP_THRESHOLD) << "\n";
+
     // Constants
     ss << "LIGHT_PI=" << STR(LIGHT_PI) << "\n";
 
