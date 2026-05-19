@@ -545,7 +545,9 @@ renderCUDA(
                     ambients, intensity,
                     rough_ptr, metal_ptr,
                     base_rgb,
-                    &point_cam
+					&bu_cam,
+    				&bv_cam,
+					&point_cam
                 );
 
 				w_indirect = w * Lout.indirect_diffuse;
@@ -751,7 +753,8 @@ renderCUDA(
 					C[ch] += albedo * w * ((&Lout.diffuse_mul_rgb.x)[ch]);
 
 					#if LIGHT_USE_PHONG
-					C[ch] += w * ((&Lout.spec_add_rgb.x)[ch]);
+					float spec_gate = alpha;
+					C[ch] += w * spec_gate * ((&Lout.spec_add_rgb.x)[ch]);
 					#endif
 				}
 				else

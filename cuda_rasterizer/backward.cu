@@ -270,9 +270,6 @@ renderCUDA(
 	float dAmb = 0.0f;
 	float dSh = 0.0f;
 
-	// shared buffers for block reduction
-	__shared__ float amb_reduce[BLOCK_SIZE];
-
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -411,6 +408,8 @@ renderCUDA(
 					ambients, intensity,
 					rough_ptr, metal_ptr,
 					base_rgb,
+					&bu_cam,
+    				&bv_cam,
 					&point_cam
 				);
 
@@ -438,7 +437,17 @@ renderCUDA(
 
 					// ambient gradient
 					#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
-						dL_dindirect_approx += dL_dchannel * (w * c);
+						// forward: channel_contribution = w * c * (indirect_diffuse * kd_rgb[ch] + ...)
+						// so d/d(indirect_diffuse) = w * c * kd_rgb[ch]
+						{
+							float kd_ch = 1.0f;
+							#if LIGHT_USE_PHONG
+								if      (ch == 0) kd_ch = (1.0f - Lout.fresnel_rgb.x) * (1.0f - Lout.metallic);
+								else if (ch == 1) kd_ch = (1.0f - Lout.fresnel_rgb.y) * (1.0f - Lout.metallic);
+								else if (ch == 2) kd_ch = (1.0f - Lout.fresnel_rgb.z) * (1.0f - Lout.metallic);
+							#endif
+							dL_dindirect_approx += dL_dchannel * (w * c * kd_ch);
+						}
 					#endif
 
 					// reccurence
@@ -844,9 +853,8 @@ renderCUDA(
 						const float t = nh * nh * (a2 - 1.0f) + 1.0f;
 						const float Dden = LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS;
 
-						const float dD_dnh =
-							(-4.0f * LIGHT_PI * a2 * nh * (a2 - 1.0f) * t) /
-							fmaxf(Dden * Dden, 1e-12f);
+						float dD_dnh_val;
+						ggx_D_and_dDdnh(Lout.ndoth, Lout.alpha2, &dD_dnh_val);
 
 						// ---------------- G term ----------------
 						// G = Gv * Gl
@@ -864,7 +872,7 @@ renderCUDA(
 						const float dG_dnl = Lout.Gv * dGl_dnl;
 
 						// ---------------- common = D * G / denom ----------------
-						float dcommon_dnh = dD_dnh * Lout.G * inv_denom;
+						float dcommon_dnh = dD_dnh_val * Lout.G * inv_denom;
 						float dcommon_dnv = 0.0f;
 						float dcommon_dnl = 0.0f;
 
@@ -1146,21 +1154,22 @@ renderCUDA(
 		}
 		}
 
-	#if LIGHT_ENABLE_BWD && LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
+	#if LIGHT_USE_LAMBERT && (LIGHT_AMBIENT_MODE == 2)
 	{
-		// write each threads contribution
+		// Block-level reduction before atomicAdd to reduce contention
+		// on the single per-scene ambient scalar
+		__shared__ float amb_reduce[BLOCK_SIZE];
 		amb_reduce[block.thread_rank()] = dAmb;
 		block.sync();
 
-		// reduce within block
-		for (int stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1)
+		// Simple tree reduction
+		for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1)
 		{
 			if (block.thread_rank() < stride)
 				amb_reduce[block.thread_rank()] += amb_reduce[block.thread_rank() + stride];
 			block.sync();
 		}
 
-		// store one atomic per block
 		if (block.thread_rank() == 0)
 			atomicAdd(&dL_dambients[0], amb_reduce[0]);
 	}

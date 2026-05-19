@@ -93,7 +93,7 @@
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS
-#define LIGHT_GGX_ROUGHNESS 0.15f
+#define LIGHT_GGX_ROUGHNESS 0.40f
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS_MAX
@@ -101,7 +101,7 @@
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS_MIN
-#define LIGHT_GGX_ROUGHNESS_MIN 0.00f
+#define LIGHT_GGX_ROUGHNESS_MIN 0.01f
 #endif
 
 #ifndef LIGHT_GGX_F0_DIELECTRIC
@@ -113,11 +113,11 @@
 #endif
 
 #ifndef LIGHT_GGX_METALLIC
-#define LIGHT_GGX_METALLIC 0.0f
+#define LIGHT_GGX_METALLIC 0.25f
 #endif
 
 #ifndef LIGHT_GGX_METALLIC_MIN
-#define LIGHT_GGX_METALLIC_MIN 0.0f
+#define LIGHT_GGX_METALLIC_MIN 0.01f
 #endif
 
 #ifndef LIGHT_GGX_METALLIC_MAX
@@ -145,7 +145,7 @@
 
 // If LIGHT_INTENSITY_MODE==0, this constant intensity is used.
 #ifndef LIGHT_INTENSITY_CONST
-#define LIGHT_INTENSITY_CONST 1.0f
+#define LIGHT_INTENSITY_CONST 10.0f
 #endif
 
 // Spotlight params
