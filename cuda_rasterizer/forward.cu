@@ -359,9 +359,8 @@ renderCUDA(
 	float dbg_sum_w = 0.0f;
 #endif
 
-	float metallic_sum = 0.0f;
-	float roughness_sum = 0.0f;
-	float material_sum_w = 0.0f;
+	float metallic_accum  = 0.0f;
+	float roughness_accum = 0.0f;
 	
 #if RENDER_AXUTILITY
 	// render axutility ouput
@@ -516,9 +515,8 @@ renderCUDA(
 				// alpha alone ignores occlusion; alpha*T matches color compositing.
 				const float material_w = w;
 
-				metallic_sum    += material_w * m_val;
-				roughness_sum   += material_w * r_val;
-				material_sum_w  += material_w;
+				metallic_accum  += w * m_val;
+				roughness_accum += w * r_val;
 			}
 
 			float w_indirect = 0.0f;
@@ -822,18 +820,18 @@ if (inside)
 }
 #endif
 
-	float metallic_final = 0.0f;
-	float roughness_final = 0.5f;
-
 	const float final_alpha = 1.0f - T;
 
-	if (material_sum_w > 1e-8f && final_alpha > 1e-4f)
+	float metallic_final  = 0.0f;
+	float roughness_final = 0.0f;
+
+	if (final_alpha > 1e-8f)
 	{
-		metallic_final  = metallic_sum  / material_sum_w;
-		roughness_final = roughness_sum / material_sum_w;
+		metallic_final  = metallic_accum  / final_alpha;
+		roughness_final = roughness_accum / final_alpha;
 	}
 
-	metallic_final = saturate01(metallic_final);
+	metallic_final  = saturate01(metallic_final);
 	roughness_final = saturate01(roughness_final);
 
 	// All threads that treat valid pixel write out their final
