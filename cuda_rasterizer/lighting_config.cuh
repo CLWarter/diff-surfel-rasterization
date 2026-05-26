@@ -56,6 +56,10 @@
 #define LIGHT_AMBIENT_FIXED 0.02f
 #endif
 
+#ifndef LIGHT_AMBIENT_MAX
+#define LIGHT_AMBIENT_MAX 0.25f
+#endif
+
 // ------------------ Lambert options ------------------
 // 0 = clamp (max(ndotl,0))
 //1 = abs(ndotl), with max being default
@@ -101,7 +105,7 @@
 #endif
 
 #ifndef LIGHT_GGX_ROUGHNESS_MIN
-#define LIGHT_GGX_ROUGHNESS_MIN 0.01f
+#define LIGHT_GGX_ROUGHNESS_MIN 0.04f
 #endif
 
 #ifndef LIGHT_GGX_F0_DIELECTRIC
@@ -113,11 +117,11 @@
 #endif
 
 #ifndef LIGHT_GGX_METALLIC
-#define LIGHT_GGX_METALLIC 0.25f
+#define LIGHT_GGX_METALLIC 0.0f
 #endif
 
 #ifndef LIGHT_GGX_METALLIC_MIN
-#define LIGHT_GGX_METALLIC_MIN 0.01f
+#define LIGHT_GGX_METALLIC_MIN 0.0f
 #endif
 
 #ifndef LIGHT_GGX_METALLIC_MAX
@@ -259,3 +263,21 @@
 #ifndef LIGHT_DEPTH_DISCARD_2D_FALLBACK
 #define LIGHT_DEPTH_DISCARD_2D_FALLBACK 1
 #endif
+
+// ----------
+
+#ifndef LIGHT_USE_SHADING_NORMAL
+#define LIGHT_USE_SHADING_NORMAL 1
+#endif
+
+#ifndef LIGHT_FACEFORWARD_SHADING_NORMAL
+#define LIGHT_FACEFORWARD_SHADING_NORMAL 1
+#endif
+
+#ifndef LIGHT_USE_GEOMETRIC_HEMISPHERE_TEST
+#define LIGHT_USE_GEOMETRIC_HEMISPHERE_TEST 1
+#endif
+
+//---
+
+#define LIGHT_SURFACE_SHADING_MODE 1

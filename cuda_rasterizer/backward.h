@@ -51,7 +51,9 @@ namespace BACKWARD
 		float* dL_dambient,
 		float* dL_dintensity,
 		float* dL_droughness,
-		float* dL_dmetallic);
+		float* dL_dmetallic,
+		float3* dL_dbasis_u_cam,
+		float3* dL_dbasis_v_cam);
 
 	void preprocess(
 		int P, int D, int M,
@@ -75,7 +77,9 @@ namespace BACKWARD
 		float* dL_dsh,
 		glm::vec3* dL_dmeans,
 		glm::vec2* dL_dscale,
-		glm::vec4* dL_drot);
+		glm::vec4* dL_drot,
+		glm::vec3* dL_dbasis_u_cam,
+		glm::vec3* dL_dbasis_v_cam);
 }
 
 #endif

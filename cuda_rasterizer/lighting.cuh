@@ -77,40 +77,6 @@ struct LightingOut {
     float3 fresnel_rgb;
 };
 
-__device__ __forceinline__ float3 apply_norm_jacobian(float3 n_raw, float3 g_unit)
-{
-    const float eps_len2 = 1e-6f; // prevent blow-up
-    float len2 = n_raw.x*n_raw.x + n_raw.y*n_raw.y + n_raw.z*n_raw.z;
-
-    if (len2 <= eps_len2) return make_float3(0.f, 0.f, 0.f);
-
-    float inv_len = rsqrtf(len2);
-    float3 n_hat = make_float3(n_raw.x * inv_len, n_raw.y * inv_len, n_raw.z * inv_len);
-
-    // Project g_unit onto tangent plane
-    float dotng = n_hat.x*g_unit.x + n_hat.y*g_unit.y + n_hat.z*g_unit.z;
-    float3 g_proj = make_float3(
-        g_unit.x - n_hat.x * dotng,
-        g_unit.y - n_hat.y * dotng,
-        g_unit.z - n_hat.z * dotng
-    );
-
-    // Scale by 1/|v|, the  Jacobian factor
-    float3 result = make_float3(
-        g_proj.x * inv_len,
-        g_proj.y * inv_len,
-        g_proj.z * inv_len
-    );
-
-    // extra clamp: prevents rare spikes even when len2 is barely above eps
-    const float grad_max = 100.0f;
-    result.x = fminf(fmaxf(result.x, -grad_max), grad_max);
-    result.y = fminf(fmaxf(result.y, -grad_max), grad_max);
-    result.z = fminf(fmaxf(result.z, -grad_max), grad_max);
-
-    return result;
-}
-
 /* DEPRECATED */
 /* __device__ __forceinline__
 float3 compute_light_dir(const float2& pixf,
@@ -230,7 +196,7 @@ __device__ __forceinline__ float ambient_value(const float* __restrict__ ambient
     return LIGHT_AMBIENT_FIXED;
 #else
     float t = sigmoidf_stable(ambients[0]);
-    return t;
+    return LIGHT_AMBIENT_MAX * t;
 #endif
 }
 
@@ -446,6 +412,94 @@ __device__ __forceinline__ float float3_avg(const float3& a)
     return (a.x + a.y + a.z) * (1.0f / 3.0f);
 }
 
+
+struct LightMaterialValues
+{
+    float metallic;
+    float roughness;
+    float dmetal_draw;
+    float drough_draw;
+};
+
+__device__ __forceinline__
+LightMaterialValues eval_light_material_values(
+    const float* __restrict__ metallic_raw,
+    const float* __restrict__ roughness_raw)
+{
+    LightMaterialValues m;
+
+    m.dmetal_draw = 0.0f;
+    m.drough_draw = 0.0f;
+
+#if (LIGHT_GGX_METALLIC_MODE == 1)
+    if (metallic_raw != nullptr)
+        m.metallic = metallic_value(metallic_raw, &m.dmetal_draw);
+    else
+    {
+        m.metallic = LIGHT_GGX_METALLIC;
+        m.dmetal_draw = 0.0f;
+    }
+#else
+    m.metallic = metallic_value(nullptr, &m.dmetal_draw);
+#endif
+
+#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
+    if (roughness_raw != nullptr)
+        m.roughness = roughness_value(roughness_raw, &m.drough_draw);
+    else
+    {
+        m.roughness = LIGHT_GGX_ROUGHNESS;
+        m.drough_draw = 0.0f;
+    }
+#else
+    m.roughness = roughness_value(nullptr, &m.drough_draw);
+#endif
+
+    m.metallic = saturate01(m.metallic);
+    m.roughness = saturate01(m.roughness);
+
+    return m;
+}
+
+__device__ __forceinline__
+float3 faceforward_basis_normal(
+    const float3& bu_cam,
+    const float3& bv_cam,
+    const float3& point_cam)
+{
+    float3 n_basis = cross(bu_cam, bv_cam);
+    n_basis = normalize_or_default(n_basis, make_float3(0.0f, 0.0f, 1.0f));
+
+    float3 view_ray = normalize_or_default(point_cam, make_float3(0.0f, 0.0f, 1.0f));
+    float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
+
+    float ndotv =
+        n_basis.x * V.x +
+        n_basis.y * V.y +
+        n_basis.z * V.z;
+
+    if (ndotv < 0.0f)
+    {
+        n_basis.x = -n_basis.x;
+        n_basis.y = -n_basis.y;
+        n_basis.z = -n_basis.z;
+    }
+
+    return n_basis;
+}
+
+__device__ __forceinline__
+float3 diffuse_kd_from_fresnel_metallic(
+    const float3& fresnel_rgb,
+    float metallic)
+{
+    return make_float3(
+        (1.0f - fresnel_rgb.x) * (1.0f - metallic),
+        (1.0f - fresnel_rgb.y) * (1.0f - metallic),
+        (1.0f - fresnel_rgb.z) * (1.0f - metallic)
+    );
+}
+
 __device__ __forceinline__
 float3 compute_ray_unnorm(const float2& pixf, int W, int H, float focal_x, float focal_y)
 {
@@ -454,348 +508,192 @@ float3 compute_ray_unnorm(const float2& pixf, int W, int H, float focal_x, float
     return make_float3(x, y, 1.0f); // unnormalized
 }
 
+
 __device__ __forceinline__
-float3 pointcam_lighting_grad_approx(
-    const LightingOut& Lout,
-    const float3& point_cam,
-    const float3& n_used,      // use the same normal you use in backward approximation
-    const float3& dL_ddiffuse_rgb,
-    const float3& dL_dspec_rgb)
+LightingOut eval_lighting_surface_values(
+    const float2& pixf,
+    int W, int H,
+    float focal_x, float focal_y,
+    float3 normal_raw,
+    float depth_cam,
+    const float* __restrict__ ambients,
+    const float* __restrict__ intensity,
+    float roughness_in,
+    float metallic_in,
+    const float3& base_color,
+    const float3* point_cam_opt = nullptr)
 {
+    float rough_local = roughness_in;
+    float metal_local = metallic_in;
+
+    LightingOut o = {};
+
+    o.diffuse_mul_rgb = make_float3(0.0f, 0.0f, 0.0f);
+    o.spec_add_rgb = make_float3(0.0f, 0.0f, 0.0f);
+
+#if (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
+    float3 n = normalize_or_default(normal_raw, make_float3(0.0f, 0.0f, 1.0f));
+
+    float3 P;
+    float3 view_ray;
+
+    if (point_cam_opt != nullptr)
+    {
+        P = *point_cam_opt;
+        view_ray = normalize_or_default(P, make_float3(0.0f, 0.0f, 1.0f));
+    }
+    else
+    {
+        view_ray = normalize_or_default(
+            make_float3((pixf.x - 0.5f * W) / focal_x,
+                        (pixf.y - 0.5f * H) / focal_y,
+                        1.0f),
+            make_float3(0.0f, 0.0f, 1.0f));
+
+        float3 r = compute_ray_unnorm(pixf, W, H, focal_x, focal_y);
+        P = make_float3(depth_cam * r.x, depth_cam * r.y, depth_cam);
+    }
+
     const float3 light_pos = make_float3(0.0f, 0.0f, 0.0f);
 
-    float3 P = point_cam;
+    float3 L = normalize_or_default(
+        make_float3(light_pos.x - P.x, light_pos.y - P.y, light_pos.z - P.z),
+        make_float3(0.0f, 0.0f, -1.0f)
+    );
 
-    // view ray = normalize(P)
-    float3 view_ray = normalize_or_default(P, make_float3(0.f, 0.f, 1.f));
-    float3 V = normalize_or_default(make_float3(-view_ray.x, -view_ray.y, -view_ray.z),
-                                    make_float3(0.f, 0.f, -1.f));
+    float3 V = normalize_or_default(
+        make_float3(-view_ray.x, -view_ray.y, -view_ray.z),
+        make_float3(0.0f, 0.0f, -1.0f)
+    );
 
-    // L = normalize(light_pos - P)
-    float3 Lraw = make_float3(light_pos.x - P.x, light_pos.y - P.y, light_pos.z - P.z);
-    float3 L = normalize_or_default(Lraw, make_float3(0.f, 0.f, -1.f));
-
-    float3 Hraw = make_float3(L.x + V.x, L.y + V.y, L.z + V.z);
-    float3 H = normalize_or_default(Hraw, make_float3(0.f, 0.f, -1.f));
-
-    float3 gP = make_float3(0.f, 0.f, 0.f);
-
-    // -------- diffuse via ndotl wrt L(P) --------
-    // -------- diffuse + spec-through-lambert via ndotl wrt L(P) --------
+    float ndotv = n.x * V.x + n.y * V.y + n.z * V.z;
+    if (ndotv < 0.0f)
     {
-        float dL_dlambert = 0.0f;
-
-        // diffuse contribution
-        #if LIGHT_USE_LAMBERT
-        {
-            float dLambert_from_diffuse = 0.0f;
-            if (Lout.lambert > 1e-6f)
-            {
-                dLambert_from_diffuse =
-                    dL_ddiffuse_rgb.x * (Lout.direct_diffuse_rgb.x / Lout.lambert) +
-                    dL_ddiffuse_rgb.y * (Lout.direct_diffuse_rgb.y / Lout.lambert) +
-                    dL_ddiffuse_rgb.z * (Lout.direct_diffuse_rgb.z / Lout.lambert);
-            }
-
-            dL_dlambert += dLambert_from_diffuse;
-        }
-        #endif
-
-        // spec contribution when spec is gated by lambert
-        #if LIGHT_USE_PHONG && (LIGHT_SPEC_GATING == 2)
-        {
-            // spec_dir_raw already represents the current pre-gated scalar spec proxy.
-            float dLambert_from_spec =
-                dL_dspec_rgb.x * Lout.spec_dir_raw_rgb.x +
-                dL_dspec_rgb.y * Lout.spec_dir_raw_rgb.y +
-                dL_dspec_rgb.z * Lout.spec_dir_raw_rgb.z;
-            dL_dlambert += dLambert_from_spec;
-        }
-        #endif
-
-        float dL_dndotl = 0.0f;
-
-        #if LIGHT_USE_LAMBERT_ABS
-            if (Lout.ndotl > 0.0f) dL_dndotl = dL_dlambert;
-            else if (Lout.ndotl < 0.0f) dL_dndotl = -dL_dlambert;
-        #else
-            if (Lout.ndotl > 0.0f) dL_dndotl = dL_dlambert;
-        #endif
-
-        if (dL_dndotl != 0.0f)
-        {
-            // ndotl = dot(n_used, L)
-            // d(ndotl)/dL = n_used
-            float3 gL = make_float3(
-                dL_dndotl * n_used.x,
-                dL_dndotl * n_used.y,
-                dL_dndotl * n_used.z
-            );
-
-            // L = normalize(light_pos - P), so dL/dP = -J_norm(Lraw)
-            float3 gLraw = apply_norm_jacobian(Lraw, gL);
-
-            gP.x -= gLraw.x;
-            gP.y -= gLraw.y;
-            gP.z -= gLraw.z;
-        }
+        n.x = -n.x;
+        n.y = -n.y;
+        n.z = -n.z;
+        ndotv = -ndotv;
     }
 
-// -------- GGX RGB spec via ndoth / ndotl wrt point_cam --------
-    #if LIGHT_USE_PHONG
-        {
-            if ((dL_dspec_rgb.x != 0.0f || dL_dspec_rgb.y != 0.0f || dL_dspec_rgb.z != 0.0f) &&
-                Lout.ndotl > 0.0f && Lout.ndotv > 0.0f)
-            {
-                const float nh = fmaxf(Lout.ndoth, 1e-6f);
-                const float a2 = Lout.alpha2;
-                const float t = nh * nh * (a2 - 1.0f) + 1.0f;
-                const float dD_dnh =
-                    (-4.0f * LIGHT_PI * a2 * nh * (a2 - 1.0f) * t) /
-                    fmaxf((LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS) * (LIGHT_PI * t * t + LIGHT_GGX_DENOM_EPS), 1e-8f);
+    float ndotl = n.x * L.x + n.y * L.y + n.z * L.z;
 
-                const float denom = fmaxf(
-                    4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS) * fmaxf(Lout.ndotl, LIGHT_GGX_NL_EPS),
-                    LIGHT_GGX_DENOM_EPS
-                );
+    o.ndotv = ndotv;
+    o.ndotl = ndotl;
 
-                const float3 pref_rgb = make_float3(
-                    (Lout.G * Lout.fresnel_rgb.x) / denom,
-                    (Lout.G * Lout.fresnel_rgb.y) / denom,
-                    (Lout.G * Lout.fresnel_rgb.z) / denom
-                );
-
-                float3 dspec_dndoth_rgb = make_float3(
-                    dD_dnh * Lout.spot * Lout.Li * pref_rgb.x,
-                    dD_dnh * Lout.spot * Lout.Li * pref_rgb.y,
-                    dD_dnh * Lout.spot * Lout.Li * pref_rgb.z
-                );
-
-                const float common_nl = (4.0f * fmaxf(Lout.ndotv, LIGHT_GGX_NV_EPS)) / (denom * denom);
-
-                float3 dspec_dndotl_rgb = make_float3(
-                    -(Lout.D * Lout.G * Lout.fresnel_rgb.x) * common_nl * Lout.spot * Lout.Li,
-                    -(Lout.D * Lout.G * Lout.fresnel_rgb.y) * common_nl * Lout.spot * Lout.Li,
-                    -(Lout.D * Lout.G * Lout.fresnel_rgb.z) * common_nl * Lout.spot * Lout.Li
-                );
-
-                #if (LIGHT_SPEC_GATING == 1)
-                    if (Lout.ndotl <= 0.0f) {
-                        dspec_dndoth_rgb = make_float3(0.0f, 0.0f, 0.0f);
-                        dspec_dndotl_rgb = make_float3(0.0f, 0.0f, 0.0f);
-                    }
-                #elif (LIGHT_SPEC_GATING == 2)
-                    // d/d(ndotl) of [spec_brdf * lambert * spot * Li]
-                    // = d(spec_brdf)/d(ndotl) * lambert  (already in dspec_dndotl_rgb with scaling below)
-                    // + spec_brdf * d(lambert)/d(ndotl)  (= spec_brdf_rgb, since d(lambert)/d(ndotl)=1 when ndotl>0)
-                    // spec_brdf_rgb = spec_dir_raw_rgb / (lambert * spot * Li)
-                    {
-                        const float light_scale = fmaxf(Lout.lambert * Lout.spot * Lout.Li, 1e-6f);
-                        dspec_dndotl_rgb = make_float3(
-                            dspec_dndotl_rgb.x * Lout.lambert + Lout.spec_dir_raw_rgb.x / light_scale,
-                            dspec_dndotl_rgb.y * Lout.lambert + Lout.spec_dir_raw_rgb.y / light_scale,
-                            dspec_dndotl_rgb.z * Lout.lambert + Lout.spec_dir_raw_rgb.z / light_scale
-                        );
-                        dspec_dndoth_rgb = make_float3(
-                            dspec_dndoth_rgb.x * Lout.lambert,
-                            dspec_dndoth_rgb.y * Lout.lambert,
-                            dspec_dndoth_rgb.z * Lout.lambert
-                        );
-                    }
-                #endif
-
-                float dL_dndoth =
-                    dL_dspec_rgb.x * dspec_dndoth_rgb.x +
-                    dL_dspec_rgb.y * dspec_dndoth_rgb.y +
-                    dL_dspec_rgb.z * dspec_dndoth_rgb.z;
-
-                float dL_dndotl =
-                    dL_dspec_rgb.x * dspec_dndotl_rgb.x +
-                    dL_dspec_rgb.y * dspec_dndotl_rgb.y +
-                    dL_dspec_rgb.z * dspec_dndotl_rgb.z;
-
-                if (dL_dndoth != 0.0f)
-                {
-                    float3 gH = make_float3(
-                        dL_dndoth * n_used.x,
-                        dL_dndoth * n_used.y,
-                        dL_dndoth * n_used.z
-                    );
-
-                    float3 gHraw = apply_norm_jacobian(Hraw, gH);
-
-                    float3 gL = gHraw;
-                    float3 gV = gHraw;
-
-                    float3 negP = make_float3(-P.x, -P.y, -P.z);
-                    float3 gNegP = apply_norm_jacobian(negP, gV);
-                    gP.x -= gNegP.x;
-                    gP.y -= gNegP.y;
-                    gP.z -= gNegP.z;
-
-                    float3 gLraw = apply_norm_jacobian(Lraw, gL);
-                    gP.x -= gLraw.x;
-                    gP.y -= gLraw.y;
-                    gP.z -= gLraw.z;
-                }
-
-                if (dL_dndotl != 0.0f)
-                {
-                    float3 gL = make_float3(
-                        dL_dndotl * n_used.x,
-                        dL_dndotl * n_used.y,
-                        dL_dndotl * n_used.z
-                    );
-
-                    float3 gLraw = apply_norm_jacobian(Lraw, gL);
-                    gP.x -= gLraw.x;
-                    gP.y -= gLraw.y;
-                    gP.z -= gLraw.z;
-                }
-            }
-        }
-    #endif
-
-// -------- spotlight wrt point_cam --------
-    #if LIGHT_USE_SPOT
-    {
-        float cosTheta = view_ray.z; // dot(view_ray, axis)
-
-        const float innerCos = cosf(LIGHT_SPOT_INNER_DEG * (LIGHT_PI / 180.f));
-        const float outerCos = cosf(LIGHT_SPOT_OUTER_DEG * (LIGHT_PI / 180.f));
-        float denom = fmaxf(innerCos - outerCos, 1e-6f);
-
-        float t = (cosTheta - outerCos) / denom;
-
-        if (t > 0.0f && t < 1.0f)
-        {
-            float ds_dt = 6.0f * t * (1.0f - t);
-            float ds_dcos = ds_dt / denom;
-
-            if (LIGHT_SPOT_EXP != 1.0f)
-            {
-                float s0 = smoothstep01(t);
-                ds_dcos *= LIGHT_SPOT_EXP * powf(fmaxf(s0, 1e-8f), LIGHT_SPOT_EXP - 1.0f);
-            }
-
-            float dL_dSpot = 0.0f;
-
-            #if LIGHT_USE_LAMBERT
-            {
-                float3 dDiff_dSpot_rgb = make_float3(0.0f, 0.0f, 0.0f);
-                if (Lout.spot > 1e-6f)
-                {
-                    dDiff_dSpot_rgb = make_float3(
-                        Lout.direct_diffuse_rgb.x / Lout.spot,
-                        Lout.direct_diffuse_rgb.y / Lout.spot,
-                        Lout.direct_diffuse_rgb.z / Lout.spot
-                    );
-                }
-
-                dL_dSpot += dL_ddiffuse_rgb.x * dDiff_dSpot_rgb.x;
-                dL_dSpot += dL_ddiffuse_rgb.y * dDiff_dSpot_rgb.y;
-                dL_dSpot += dL_ddiffuse_rgb.z * dDiff_dSpot_rgb.z;
-            }
-            #endif
-
-            #if LIGHT_USE_PHONG
-            {
-                float3 dSpec_dSpot_rgb = make_float3(
-                    Lout.spec_add_rgb.x / fmaxf(Lout.spot, 1e-6f),
-                    Lout.spec_add_rgb.y / fmaxf(Lout.spot, 1e-6f),
-                    Lout.spec_add_rgb.z / fmaxf(Lout.spot, 1e-6f)
-                );
-
-                #if (LIGHT_SPEC_GATING == 1)
-                    if (Lout.ndotl <= 0.0f)
-                        dSpec_dSpot_rgb = make_float3(0.0f, 0.0f, 0.0f);
-                #endif
-
-                dL_dSpot += dL_dspec_rgb.x * dSpec_dSpot_rgb.x;
-                dL_dSpot += dL_dspec_rgb.y * dSpec_dSpot_rgb.y;
-                dL_dSpot += dL_dspec_rgb.z * dSpec_dSpot_rgb.z;
-            }
-            #endif
-
-            float dL_dcos = dL_dSpot * ds_dcos;
-
-            float3 g_view = make_float3(0.f, 0.f, dL_dcos);
-            float3 gP_view = apply_norm_jacobian(P, g_view);
-
-            gP.x += gP_view.x;
-            gP.y += gP_view.y;
-            gP.z += gP_view.z;
-        }
-    }
-    #endif
-
-    // -------- falloff wrt point_cam --------
-#if (FALLOFF_MODE == 1)
-    {
-        float dL_dLi = 0.0f;
-
-        #if LIGHT_USE_LAMBERT
-        {
-            const float3 dDiff_dLi_rgb = make_float3(
-                Lout.direct_diffuse_rgb.x / fmaxf(Lout.Li, 1e-6f),
-                Lout.direct_diffuse_rgb.y / fmaxf(Lout.Li, 1e-6f),
-                Lout.direct_diffuse_rgb.z / fmaxf(Lout.Li, 1e-6f)
-            );
-
-            dL_dLi += dL_ddiffuse_rgb.x * dDiff_dLi_rgb.x;
-            dL_dLi += dL_ddiffuse_rgb.y * dDiff_dLi_rgb.y;
-            dL_dLi += dL_ddiffuse_rgb.z * dDiff_dLi_rgb.z;
-        }
-        #endif
-
-        #if LIGHT_USE_PHONG
-        {
-            float3 dSpec_dLi_rgb = make_float3(
-                Lout.spec_add_rgb.x / fmaxf(Lout.Li, 1e-6f),
-                Lout.spec_add_rgb.y / fmaxf(Lout.Li, 1e-6f),
-                Lout.spec_add_rgb.z / fmaxf(Lout.Li, 1e-6f)
-            );
-
-            #if (LIGHT_SPEC_GATING == 1)
-                if (Lout.ndotl <= 0.0f)
-                    dSpec_dLi_rgb = make_float3(0.0f, 0.0f, 0.0f);
-            #elif (LIGHT_SPEC_GATING == 2)
-                dSpec_dLi_rgb = make_float3(
-                    dSpec_dLi_rgb.x * Lout.lambert,
-                    dSpec_dLi_rgb.y * Lout.lambert,
-                    dSpec_dLi_rgb.z * Lout.lambert
-                );
-            #endif
-
-            dL_dLi += dL_dspec_rgb.x * dSpec_dLi_rgb.x;
-            dL_dLi += dL_dspec_rgb.y * dSpec_dLi_rgb.y;
-            dL_dLi += dL_dspec_rgb.z * dSpec_dLi_rgb.z;
-        }
-        #endif
-
-        float3 LP = make_float3(P.x - light_pos.x, P.y - light_pos.y, P.z - light_pos.z);
-        float dist2 = fmaxf(LP.x*LP.x + LP.y*LP.y + LP.z*LP.z, 1e-4f);
-
-        const float k = FALLOFF_K;
-        float inv = 1.0f / (1.0f + k * dist2);
-        float dInv_dDist2 = -k * inv * inv;
-
-        float dLi_dDist2 = Lout.I * dInv_dDist2;
-
-        #if (LIGHT_LI_CLAMP > 0)
-            if (Lout.li_clamped > 0.5f)
-                dLi_dDist2 = 0.0f;
-        #endif
-
-        float dL_dDist2 = dL_dLi * dLi_dDist2;
-
-        gP.x += dL_dDist2 * 2.0f * LP.x;
-        gP.y += dL_dDist2 * 2.0f * LP.y;
-        gP.z += dL_dDist2 * 2.0f * LP.z;
-    }
+#if LIGHT_USE_LAMBERT
+    float lambert = fmaxf(ndotl, 0.0f);
+#else
+    float lambert = 1.0f;
 #endif
 
-    return gP;
+    o.lambert = lambert;
+    o.spot = spotlight_factor(view_ray);
+
+    float a = ambient_value(ambients);
+    o.ambient = a;
+
+    float dI_dummy = 0.0f;
+    float I = intensity_value(intensity, &dI_dummy);
+    o.I = I;
+    o.dI_raw = dI_dummy;
+
+    float3 LP = make_float3(P.x - light_pos.x, P.y - light_pos.y, P.z - light_pos.z);
+    float dist2 = fmaxf(LP.x * LP.x + LP.y * LP.y + LP.z * LP.z, 1e-4f);
+
+#if (FALLOFF_MODE == 1)
+    o.inv = 1.0f / (1.0f + FALLOFF_K * dist2);
+#else
+    o.inv = 1.0f;
+#endif
+
+    o.Li = I * o.inv;
+    o.intensity = o.Li;
+
+    o.roughness = saturate01(rough_local);
+    o.metallic = saturate01(metal_local);
+
+    o.alpha = o.roughness * o.roughness;
+    o.alpha2 = o.alpha * o.alpha;
+
+    float3 base_clamped = make_float3(
+        saturate01(base_color.x),
+        saturate01(base_color.y),
+        saturate01(base_color.z)
+    );
+
+    o.F0_rgb = make_float3(
+        LIGHT_GGX_F0_DIELECTRIC * (1.0f - o.metallic) + base_clamped.x * o.metallic,
+        LIGHT_GGX_F0_DIELECTRIC * (1.0f - o.metallic) + base_clamped.y * o.metallic,
+        LIGHT_GGX_F0_DIELECTRIC * (1.0f - o.metallic) + base_clamped.z * o.metallic
+    );
+
+    o.diffuse_brdf = 1.0f / LIGHT_PI;
+    o.direct_diffuse_raw = o.diffuse_brdf * lambert * o.spot * o.Li;
+    o.indirect_diffuse = a;
+
+    float3 F_rgb = o.F0_rgb;
+    float3 spec_brdf_rgb = make_float3(0.0f, 0.0f, 0.0f);
+
+#if LIGHT_USE_PHONG
+    float3 Hh = normalize_or_default(
+        make_float3(L.x + V.x, L.y + V.y, L.z + V.z),
+        make_float3(0.0f, 0.0f, -1.0f)
+    );
+
+    o.ndoth = fmaxf(n.x * Hh.x + n.y * Hh.y + n.z * Hh.z, 0.0f);
+    o.vdoth = fmaxf(V.x * Hh.x + V.y * Hh.y + V.z * Hh.z, 0.0f);
+
+    if (ndotl > 0.0f && ndotv > 0.0f)
+    {
+        float nv = fmaxf(ndotv, LIGHT_GGX_NV_EPS);
+        float nl = fmaxf(ndotl, LIGHT_GGX_NL_EPS);
+
+        o.D = ggx_D_and_dDdnh(o.ndoth, o.alpha2, nullptr);
+        o.Gv = smith_G1_schlick_ggx(nv, o.roughness);
+        o.Gl = smith_G1_schlick_ggx(nl, o.roughness);
+        o.G = o.Gv * o.Gl;
+
+        F_rgb = fresnel_schlick_rgb(o.vdoth, o.F0_rgb);
+        float common = (o.D * o.G) / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
+        spec_brdf_rgb = float3_scale(F_rgb, common);
+    }
+
+    o.fresnel_rgb = F_rgb;
+    o.fresnel = float3_avg(F_rgb);
+
+    const float spec_nl = fmaxf(o.ndotl, 0.0f);
+    o.spec_add_rgb = float3_scale(spec_brdf_rgb, spec_nl * o.spot * o.Li);
+    o.spec_add = float3_avg(o.spec_add_rgb);
+#endif
+
+    float3 kd_rgb = make_float3(
+        (1.0f - F_rgb.x) * (1.0f - o.metallic),
+        (1.0f - F_rgb.y) * (1.0f - o.metallic),
+        (1.0f - F_rgb.z) * (1.0f - o.metallic)
+    );
+
+    o.direct_diffuse_rgb = make_float3(
+        o.direct_diffuse_raw * kd_rgb.x,
+        o.direct_diffuse_raw * kd_rgb.y,
+        o.direct_diffuse_raw * kd_rgb.z
+    );
+
+    o.indirect_approx_rgb = make_float3(
+        o.indirect_diffuse * kd_rgb.x,
+        o.indirect_diffuse * kd_rgb.y,
+        o.indirect_diffuse * kd_rgb.z
+    );
+
+    o.diffuse_mul_rgb = make_float3(
+        o.indirect_approx_rgb.x + o.direct_diffuse_rgb.x,
+        o.indirect_approx_rgb.y + o.direct_diffuse_rgb.y,
+        o.indirect_approx_rgb.z + o.direct_diffuse_rgb.z
+    );
+
+    o.diffuse_mul = float3_avg(o.diffuse_mul_rgb);
+#endif
+
+    return o;
 }
 
 __device__ __forceinline__
@@ -881,7 +779,8 @@ LightingOut eval_lighting(
     o.fresnel_rgb        = o.F0_rgb;
 
 #if (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
-    float3 n = normalize_or_default(normal_raw, make_float3(0.f, 0.f, 1.f));
+    float3 Ng = normalize_or_default(normal_raw, make_float3(0.f, 0.f, 1.f));
+    float3 Ns = Ng;
     
     // ------------------------------------------------------------
     // Surface point / view direction source
@@ -925,46 +824,55 @@ LightingOut eval_lighting(
     float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
     V = normalize_or_default(V, make_float3(0.f, 0.f, -1.f));
 
-    float ndotv = n.x * V.x + n.y * V.y + n.z * V.z;
+    float NgdotL = Ng.x * L.x + Ng.y * L.y + Ng.z * L.z;
+    float NgdotV = Ng.x * V.x + Ng.y * V.y + Ng.z * V.z;
+
+    #if LIGHT_USE_GEOMETRIC_HEMISPHERE_TEST
+        if (NgdotL <= 0.0f || NgdotV <= 0.0f)
+        {
+            o.ndotl = 0.0f;
+            o.ndotv = 0.0f;
+            o.lambert = 0.0f;
+            return o;
+        }
+    #endif
 
     // spotlight cone depends on camera -> surface direction
     float spot = spotlight_factor(view_ray);
 
-    float ndotl = n.x * L.x + n.y * L.y + n.z * L.z;
-
     if (bu_cam_opt && bv_cam_opt)
     {
         float3 n_from_basis = cross(*bu_cam_opt, *bv_cam_opt);
-        n_from_basis = normalize_or_default(n_from_basis, make_float3(0,0,1));
+        n_from_basis = normalize_or_default(n_from_basis, Ng);
 
-        float ndotv_basis =
-            n_from_basis.x * V.x +
-            n_from_basis.y * V.y +
-            n_from_basis.z * V.z;
+         #if LIGHT_FACEFORWARD_SHADING_NORMAL
+            float d = n_from_basis.x * Ng.x + n_from_basis.y * Ng.y + n_from_basis.z * Ng.z;
+            if (d < 0.0f)
+            {
+                n_from_basis.x = -n_from_basis.x;
+                n_from_basis.y = -n_from_basis.y;
+                n_from_basis.z = -n_from_basis.z;
+            }
+        #endif
 
-        if (ndotv_basis < 0.0f)
-        {
-            n_from_basis.x = -n_from_basis.x;
-            n_from_basis.y = -n_from_basis.y;
-            n_from_basis.z = -n_from_basis.z;
-        }
-
-        n = n_from_basis;
+        #if LIGHT_USE_SHADING_NORMAL
+            Ns = n_from_basis;
+        #endif
     }
-    else
-    {
-        n = normalize_or_default(normal_raw, make_float3(0,0,1));
-    }
-    o.ndotv = ndotv;
+    
+    float NsdotL = Ns.x * L.x + Ns.y * L.y + Ns.z * L.z;
+    float NsdotV = Ns.x * V.x + Ns.y * V.y + Ns.z * V.z;
+
+    o.ndotv = NsdotV;
     o.spot = spot;
-    o.ndotl = ndotl;
+    o.ndotl = NsdotL;
 
     // lambert
 #if LIGHT_USE_LAMBERT
   #if LIGHT_LAMBERT_ABS
-    float lambert = fabsf(ndotl);
+    float lambert = fabsf(o.ndotl);
   #else
-    float lambert = fmaxf(ndotl, 0.0f);
+    float lambert = fmaxf(o.ndotl, 0.0f);
   #endif
 #else
     float lambert = 1.0f;
@@ -1107,7 +1015,7 @@ LightingOut eval_lighting(
         make_float3(0.f, 0.f, -1.f)
     );
 
-    float ndoth = fmaxf(n.x * Hh.x + n.y * Hh.y + n.z * Hh.z, 0.0f);
+    float ndoth = fmaxf(Ns.x * Hh.x + Ns.y * Hh.y + Ns.z * Hh.z, 0.0f);
     float vdoth = fmaxf(V.x * Hh.x + V.y * Hh.y + V.z * Hh.z, 0.0f);
     o.ndoth = ndoth;
     o.vdoth = vdoth;
@@ -1117,10 +1025,10 @@ LightingOut eval_lighting(
     float3 F_rgb = o.F0_rgb;
     float3 spec_brdf_rgb = make_float3(0.0f, 0.0f, 0.0f);
 
-    if (ndotl > 0.0f && o.ndotv > 0.0f)
+    if (o.ndotl > 0.0f && o.ndotv > 0.0f)
     {
         float nv = fmaxf(o.ndotv, LIGHT_GGX_NV_EPS);
-        float nl = fmaxf(ndotl, LIGHT_GGX_NL_EPS);
+        float nl = fmaxf(o.ndotl, LIGHT_GGX_NL_EPS);
 
         D = ggx_D_and_dDdnh(ndoth, o.alpha2, nullptr);
         Gv = smith_G1_schlick_ggx(nv, o.roughness);
@@ -1134,11 +1042,12 @@ LightingOut eval_lighting(
         spec_brdf_scalar = float3_avg(spec_brdf_rgb);
     }
 
-    float3 spec_dir_raw_rgb = float3_scale(spec_brdf_rgb, lambert * spot * Li);
+    const float spec_nl = fmaxf(o.ndotl, 0.0f);
+    float3 spec_dir_raw_rgb = float3_scale(spec_brdf_rgb, spec_nl * spot * Li);
     float3 spec_dir_gated_rgb = spec_dir_raw_rgb;
 
     #if (LIGHT_SPEC_GATING == 1)
-        if (ndotl <= 0.0f || o.ndotv <= 0.0f)
+        if (o.ndotl <= 0.0f || o.ndotv <= 0.0f)
             spec_dir_gated_rgb = make_float3(0.0f, 0.0f, 0.0f);
     #endif
 

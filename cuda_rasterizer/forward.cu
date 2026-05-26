@@ -351,6 +351,20 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 
+#if LIGHT_SURFACE_SHADING_MODE
+
+	float surf_w_sum = 0.0f;
+
+	float3 surf_P_sum = make_float3(0.0f, 0.0f, 0.0f);
+	float3 surf_N_sum = make_float3(0.0f, 0.0f, 0.0f);
+	float3 surf_base_sum = make_float3(0.0f, 0.0f, 0.0f);
+
+	float surf_rough_sum = 0.0f;
+	float surf_metal_sum = 0.0f;
+	float surf_depth_sum = 0.0f;
+
+#endif
+
 #if (LIGHT_DEBUG_MODE > 0)
 	float dbg_best = 0.0f;
 	float dbg_best_w = 0.0f;
@@ -488,28 +502,13 @@ renderCUDA(
 			{
 				const int gid_mat = collected_id[j];
 
-				float dmetal_dummy = 0.0f;
-				float drough_dummy = 0.0f;
+				LightMaterialValues mat = eval_light_material_values(
+					metallic != nullptr ? metallic + gid_mat : nullptr,
+					roughness != nullptr ? roughness + gid_mat : nullptr
+				);
 
-				float m_val = 0.0f;
-				float r_val = 0.5f;
-
-				#if (LIGHT_GGX_METALLIC_MODE == 1)
-					if (metallic != nullptr)
-						m_val = metallic_value(metallic + gid_mat, &dmetal_dummy);
-				#else
-					m_val = metallic_value(nullptr, &dmetal_dummy);
-				#endif
-
-				#if (LIGHT_GGX_ROUGHNESS_MODE == 1)
-					if (roughness != nullptr)
-						r_val = roughness_value(roughness + gid_mat, &drough_dummy);
-				#else
-					r_val = roughness_value(nullptr, &drough_dummy);
-				#endif
-
-				m_val = saturate01(m_val);
-				r_val = saturate01(r_val);
+				float m_val = mat.metallic;
+				float r_val = mat.roughness;
 
 				// Correct visible contribution weight.
 				// alpha alone ignores occlusion; alpha*T matches color compositing.
@@ -520,46 +519,48 @@ renderCUDA(
 			}
 
 			float w_indirect = 0.0f;
-			float w_direct   = w;    // compatibility if lighting disabled
+			float w_direct   = w;
 
-            LightingOut Lout = {};
-            const float* rough_ptr = nullptr;
+			LightingOut Lout = {};
+
+			#if !LIGHT_SURFACE_SHADING_MODE
+			const float* rough_ptr = nullptr;
 			const float* metal_ptr = nullptr;
 
 			#if LIGHT_ENABLE_FWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
 			{
 				float3 n_raw = make_float3(normal[0], normal[1], normal[2]);
 				const int gid = collected_id[j];
+
 				rough_ptr = roughness + gid;
 				metal_ptr = metallic + gid;
 
 				float3 base_rgb = make_float3(
-                    features[collected_id[j] * CHANNELS + 0],
-					features[collected_id[j] * CHANNELS + 1],
-					features[collected_id[j] * CHANNELS + 2]
-                );
+					features[gid * CHANNELS + 0],
+					features[gid * CHANNELS + 1],
+					features[gid * CHANNELS + 2]
+				);
 
-                Lout = eval_lighting(
-                    pixf, W, H, focal_x, focal_y,
-                    n_raw, depth,
-                    ambients, intensity,
-                    rough_ptr, metal_ptr,
-                    base_rgb,
+				Lout = eval_lighting(
+					pixf, W, H, focal_x, focal_y,
+					n_raw, depth,
+					ambients, intensity,
+					rough_ptr, metal_ptr,
+					base_rgb,
 					&bu_cam,
-    				&bv_cam,
+					&bv_cam,
 					&point_cam
-                );
+				);
 
 				w_indirect = w * Lout.indirect_diffuse;
 				w_direct   = w * Lout.direct_diffuse;
-
-				}
-				#else
-				{
-					// original no-lighting behavior
-					w_indirect = 0.0f;
-					w_direct   = w;
-				}
+			}
+			#else
+			{
+				w_indirect = 0.0f;
+				w_direct   = w;
+			}
+			#endif
 			#endif
 
 #if RENDER_AXUTILITY
@@ -590,7 +591,7 @@ renderCUDA(
 			}
 #endif
 
-#if (LIGHT_DEBUG_MODE > 0)
+			#if (LIGHT_DEBUG_MODE > 0) && !LIGHT_SURFACE_SHADING_MODE
 			{
 				float dbg = 0.0f;
 
@@ -741,6 +742,50 @@ renderCUDA(
 			}
 #endif
 
+		#if LIGHT_SURFACE_SHADING_MODE
+
+			{
+				const int gid_surf = collected_id[j];
+
+				float3 base_rgb = make_float3(
+					features[gid_surf * CHANNELS + 0],
+					features[gid_surf * CHANNELS + 1],
+					features[gid_surf * CHANNELS + 2]
+				);
+
+				float3 n_basis = faceforward_basis_normal(bu_cam, bv_cam, point_cam);
+
+				LightMaterialValues mat = eval_light_material_values(
+					metallic != nullptr ? metallic + gid_surf : nullptr,
+					roughness != nullptr ? roughness + gid_surf : nullptr
+				);
+
+				float m_val = mat.metallic;
+				float r_val = mat.roughness;
+
+				surf_w_sum += w;
+
+				surf_P_sum.x += w * point_cam.x;
+				surf_P_sum.y += w * point_cam.y;
+				surf_P_sum.z += w * point_cam.z;
+
+				surf_N_sum.x += w * n_basis.x;
+				surf_N_sum.y += w * n_basis.y;
+				surf_N_sum.z += w * n_basis.z;
+
+				surf_base_sum.x += w * base_rgb.x;
+				surf_base_sum.y += w * base_rgb.y;
+				surf_base_sum.z += w * base_rgb.z;
+
+				surf_rough_sum += w * r_val;
+				surf_metal_sum += w * m_val;
+				
+				// depth may be invalid in fallback mode.
+				// Use point_cam.z as the safe fallback depth.
+				surf_depth_sum += w * (depth_valid ? depth : point_cam.z);
+			}
+
+		#else
 			// Diffuse
 			#pragma unroll
 			// Eq. (3) from 3D Gaussian splatting paper.
@@ -766,6 +811,8 @@ renderCUDA(
 				#endif
 			}
 
+		#endif
+
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -778,6 +825,75 @@ renderCUDA(
             }
 		}
 	}
+
+	#if LIGHT_SURFACE_SHADING_MODE
+
+		if (inside && surf_w_sum > 1e-8f)
+		{
+			const float invW = 1.0f / surf_w_sum;
+
+			float3 surf_P = make_float3(
+				surf_P_sum.x * invW,
+				surf_P_sum.y * invW,
+				surf_P_sum.z * invW
+			);
+
+			float3 surf_N = normalize_or_default(
+				make_float3(
+					surf_N_sum.x * invW,
+					surf_N_sum.y * invW,
+					surf_N_sum.z * invW
+				),
+				make_float3(0.0f, 0.0f, 1.0f)
+			);
+
+			float3 surf_base = make_float3(
+				surf_base_sum.x * invW,
+				surf_base_sum.y * invW,
+				surf_base_sum.z * invW
+			);
+
+			float surf_rough = surf_rough_sum * invW;
+			float surf_metal = surf_metal_sum * invW;
+			float surf_depth = surf_depth_sum * invW;
+
+			LightingOut Lsurf =
+				eval_lighting_surface_values(
+					pixf,
+					W, H,
+					focal_x,
+					focal_y,
+					surf_N,
+					surf_depth,
+					ambients,
+					intensity,
+					surf_rough,
+					surf_metal,
+					surf_base,
+					&surf_P
+				);
+
+			const float surface_alpha = 1.0f - T;
+
+			C[0] = surface_alpha * (
+				surf_base.x * Lsurf.diffuse_mul_rgb.x +
+				Lsurf.spec_add_rgb.x
+			);
+
+			C[1] = surface_alpha * (
+				surf_base.y * Lsurf.diffuse_mul_rgb.y +
+				Lsurf.spec_add_rgb.y
+			);
+
+			C[2] = surface_alpha * (
+				surf_base.z * Lsurf.diffuse_mul_rgb.z +
+				Lsurf.spec_add_rgb.z
+			);
+
+			for (int ch = 3; ch < CHANNELS; ch++)
+				C[ch] = 0.0f;
+		}
+	#endif
 
 #if (LIGHT_DEBUG_MODE > 0) && (LIGHT_DEBUG_MODE != 7)
 if (inside)
@@ -828,11 +944,20 @@ if (inside)
 	float metallic_final  = 0.0f;
 	float roughness_final = 0.0f;
 
+	#if LIGHT_SURFACE_SHADING_MODE
+	if (surf_w_sum > 1e-8f)
+	{
+		const float invW = 1.0f / surf_w_sum;
+		metallic_final  = surf_metal_sum * invW;
+		roughness_final = surf_rough_sum * invW;
+	}
+	#else
 	if (final_alpha > 1e-8f)
 	{
 		metallic_final  = metallic_accum  / final_alpha;
 		roughness_final = roughness_accum / final_alpha;
 	}
+	#endif
 
 	metallic_final  = saturate01(metallic_final);
 	roughness_final = saturate01(roughness_final);
