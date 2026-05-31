@@ -715,11 +715,7 @@ renderCUDA(
 				#if (LIGHT_DEBUG_MODE != 7)
 					dbg = saturate01(dbg);
 
-					#if (LIGHT_DEBUG_MODE == 10 || LIGHT_DEBUG_MODE == 11)
-						float dbg_w = alpha;   // material map: ignore transmittance dilution
-					#else
-						float dbg_w = w;       // lighting/debug maps: use real compositing weight
-					#endif
+					float dbg_w = w;
 
 					dbg_sum   += dbg_w * dbg;
 					dbg_sum_w += dbg_w;
@@ -798,8 +794,7 @@ renderCUDA(
 					C[ch] += albedo * w * ((&Lout.diffuse_mul_rgb.x)[ch]);
 
 					#if LIGHT_USE_PHONG
-					float spec_gate = alpha;
-					C[ch] += w * spec_gate * ((&Lout.spec_add_rgb.x)[ch]);
+					C[ch] += w * ((&Lout.spec_add_rgb.x)[ch]);
 					#endif
 				}
 				else

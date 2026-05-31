@@ -607,6 +607,12 @@ LightingOut eval_lighting_surface_values(
 #endif
 
     o.Li = I * o.inv;
+    #if (LIGHT_LI_CLAMP > 0)
+        if (o.Li > (float)LIGHT_LI_CLAMP) {
+            o.Li = (float)LIGHT_LI_CLAMP;
+            o.li_clamped = 1.0f;
+        }
+    #endif
     o.intensity = o.Li;
 
     o.roughness = saturate01(rough_local);

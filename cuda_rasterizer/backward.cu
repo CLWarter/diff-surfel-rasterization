@@ -304,17 +304,28 @@ float3 pointcam_lighting_grad_approx(
                         dspec_dndoth_rgb = make_float3(0.0f, 0.0f, 0.0f);
                         dspec_dndotl_rgb = make_float3(0.0f, 0.0f, 0.0f);
                     }
-                #elif (LIGHT_SPEC_GATING == 2)
+				#elif (LIGHT_SPEC_GATING == 2)
                     // d/d(ndotl) of [spec_brdf * lambert * spot * Li]
-                    // = d(spec_brdf)/d(ndotl) * lambert  (already in dspec_dndotl_rgb with scaling below)
-                    // + spec_brdf * d(lambert)/d(ndotl)  (= spec_brdf_rgb, since d(lambert)/d(ndotl)=1 when ndotl>0)
-                    // spec_brdf_rgb = spec_dir_raw_rgb / (lambert * spot * Li)
+                    // = d(spec_brdf)/d(ndotl) * lambert 
+                    // + spec_brdf * d(lambert)/d(ndotl) 
                     {
-                        const float light_scale = fmaxf(Lout.lambert * Lout.spot * Lout.Li, 1e-6f);
+                        const float gating_factor = Lout.lambert * Lout.spot * Lout.Li;
+                        float3 spec_pixel_contrib = make_float3(0.f, 0.f, 0.f);
+                        
+                        // If the gating factor is too small, zero out the scaling derivative
+                        // component to avoid division spike jumps.
+                        if (gating_factor > 1e-4f) {
+                            spec_pixel_contrib = make_float3(
+                                Lout.spec_dir_raw_rgb.x / gating_factor,
+                                Lout.spec_dir_raw_rgb.y / gating_factor,
+                                Lout.spec_dir_raw_rgb.z / gating_factor
+                            );
+                        }
+
                         dspec_dndotl_rgb = make_float3(
-                            dspec_dndotl_rgb.x * Lout.lambert + Lout.spec_dir_raw_rgb.x / light_scale,
-                            dspec_dndotl_rgb.y * Lout.lambert + Lout.spec_dir_raw_rgb.y / light_scale,
-                            dspec_dndotl_rgb.z * Lout.lambert + Lout.spec_dir_raw_rgb.z / light_scale
+                            dspec_dndotl_rgb.x * Lout.lambert + spec_pixel_contrib.x,
+                            dspec_dndotl_rgb.y * Lout.lambert + spec_pixel_contrib.y,
+                            dspec_dndotl_rgb.z * Lout.lambert + spec_pixel_contrib.z
                         );
                         dspec_dndoth_rgb = make_float3(
                             dspec_dndoth_rgb.x * Lout.lambert,
@@ -917,12 +928,10 @@ renderCUDA(
 			const float common = (Lsurf.D * Lsurf.G) / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
 			const float spec_scale = Lsurf.lambert * Lsurf.spot * Lsurf.Li;
 
-			// F0_rgb = 0.04 * (1 - metallic) + base * metallic
-			const float dspec_dbase_common = Lsurf.metallic * dF_dF0 * common * spec_scale;
-
-			dL_dsurf_base.x += surface_alpha * dL_dpixel[0] * dspec_dbase_common;
-			dL_dsurf_base.y += surface_alpha * dL_dpixel[1] * dspec_dbase_common;
-			dL_dsurf_base.z += surface_alpha * dL_dpixel[2] * dspec_dbase_common;
+			// F0_rgb = 0.04 * (1 - metallic) + base * metallic.
+			// The specular-to-base gradient is intentionally blocked: we want the
+			// stored base color to represent pure diffuse albedo, not to absorb
+			// specular residuals. Roughness/metallic carry the specular signal.
 		}
 
 		// roughness gradient: D term + Smith G term
@@ -943,9 +952,11 @@ renderCUDA(
 			const float invden = 1.0f / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
 			const float spec_scale = Lsurf.lambert * Lsurf.spot * Lsurf.Li;
 
-			// alpha2 = roughness^4
-			const float da2_dr = 4.0f * r * r * r;
+			// D-path: dD/d(alpha) = dD_da2 * 2*alpha,  alpha = r^2
+			const float alpha = r * r;
+			const float dCommon_dalpha_D = dD_da2 * 2.0f * alpha * Lsurf.G * invden;
 
+			// G-path: dG/d(alpha) = dG_dr * dr/d(alpha) = dG_dr / (2r)
 			const float k_ggx = ((r + 1.0f) * (r + 1.0f)) * 0.125f;
 			const float dk_dr = 0.25f * (r + 1.0f);
 
@@ -957,17 +968,19 @@ renderCUDA(
 
 			const float dGv_dr = -nv * ddenom_v_dr / fmaxf(denom_v * denom_v, 1e-12f);
 			const float dGl_dr = -nl * ddenom_l_dr / fmaxf(denom_l * denom_l, 1e-12f);
-			const float dG_dr = dGv_dr * Lsurf.Gl + Lsurf.Gv * dGl_dr;
+			const float dG_dr  = dGv_dr * Lsurf.Gl + Lsurf.Gv * dGl_dr;
 
-			const float dCommon_dr_D = dD_da2 * da2_dr * Lsurf.G * invden;
-			const float dCommon_dr_G = Lsurf.D * dG_dr * invden;
-			const float dCommon_dr = dCommon_dr_D + dCommon_dr_G;
+			const float dr_dalpha      = 0.5f / r;
+			const float dCommon_dalpha_G = Lsurf.D * (dG_dr * dr_dalpha) * invden;
 
+			const float dCommon_dalpha = dCommon_dalpha_D + dCommon_dalpha_G;
+
+			// dL_dsurf_rough = dL/d(alpha); multiplied by d(alpha)/d(raw) = drough_draw
 			dL_dsurf_rough =
 				surface_alpha * spec_scale * (
-					dL_dpixel[0] * Lsurf.fresnel_rgb.x * dCommon_dr +
-					dL_dpixel[1] * Lsurf.fresnel_rgb.y * dCommon_dr +
-					dL_dpixel[2] * Lsurf.fresnel_rgb.z * dCommon_dr
+					dL_dpixel[0] * Lsurf.fresnel_rgb.x * dCommon_dalpha +
+					dL_dpixel[1] * Lsurf.fresnel_rgb.y * dCommon_dalpha +
+					dL_dpixel[2] * Lsurf.fresnel_rgb.z * dCommon_dalpha
 				);
 		}
 
@@ -1066,6 +1079,11 @@ renderCUDA(
 
 			float dL_dI = dL_dLi * Lsurf.inv;
 			float dL_dIraw = dL_dI * Lsurf.dI_raw;
+
+			#if (LIGHT_LI_CLAMP > 0)
+				if (Lsurf.li_clamped > 0.5f)
+					dL_dIraw = 0.0f;
+			#endif
 
 			atomicAdd(&dL_dintensity_raw[0], dL_dIraw);
 		}
@@ -1386,6 +1404,9 @@ renderCUDA(
 
 			#if LIGHT_SURFACE_SHADING_MODE
 			float dL_dalpha_surface = 0.0f;
+			#endif
+
+			#if RENDER_AXUTILITY
 			float dL_dalpha_aux = 0.0f;
 			#endif
 
@@ -1441,7 +1462,7 @@ renderCUDA(
 		atomicAdd(&dL_dcolors[gid * C + 2], coeff * dL_dsurf_base.z);
 
 #if (LIGHT_GGX_ROUGHNESS_MODE == 1)
-		atomicAdd(&dL_droughness[gid], coeff * dL_dsurf_rough * drough_draw);
+		atomicAdd(&dL_droughness[gid], coeff * dL_dsurf_rough * 2.0f * Lsurf.roughness * drough_draw);
 #endif
 
 #if (LIGHT_GGX_METALLIC_MODE == 1)
@@ -1452,7 +1473,7 @@ renderCUDA(
 		dL_dw += dL_dsurf_base.y * (base_rgb.y - surf_base.y) * invW;
 		dL_dw += dL_dsurf_base.z * (base_rgb.z - surf_base.z) * invW;
 
-		dL_dw += dL_dsurf_rough * (r_val - surf_rough) * invW;
+		dL_dw += dL_dsurf_rough * 2.0f * Lsurf.roughness * (r_val - surf_rough) * invW;
 		dL_dw += dL_dsurf_metal * (m_val - surf_metal) * invW;
 
 		dL_dw += dL_dsurf_P.x * (point_cam.x - surf_P.x) * invW;
@@ -1748,12 +1769,12 @@ renderCUDA(
 					);
 
 					// alpha2 = roughness^4  => d(alpha2)/d(roughness) = 4 r^3
-					const float r  = fmaxf(Lout.roughness, 1e-6f);
-					const float da2_dr = 4.0f * r * r * r;
-					const float3 dspec_dr_from_D_rgb = make_float3(
-						dspec_da2_rgb.x * da2_dr,
-						dspec_da2_rgb.y * da2_dr,
-						dspec_da2_rgb.z * da2_dr
+					const float r     = fmaxf(Lout.roughness, 1e-6f);
+					const float alpha = r * r;
+					const float3 dspec_dalpha_from_D_rgb = make_float3(
+						dspec_da2_rgb.x * 2.0f * alpha,
+						dspec_da2_rgb.y * 2.0f * alpha,
+						dspec_da2_rgb.z * 2.0f * alpha
 					);
 
 					// Smith G term derivative wrt roughness
@@ -1783,18 +1804,21 @@ renderCUDA(
 						(Lout.fresnel_rgb.z * Lout.D / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS)) * Lout.lambert * Lout.spot * Lout.Li
 					);
 
-					const float3 dspec_dr_from_G_rgb = make_float3(
-						dspec_dG_rgb.x * dG_dr,
-						dspec_dG_rgb.y * dG_dr,
-						dspec_dG_rgb.z * dG_dr
+					// G path: d(spec)/d(alpha) = d(spec)/d(roughness) * d(roughness)/d(alpha) = dG_dr / (2r)
+					const float dr_dalpha = 0.5f / r;
+					const float3 dspec_dalpha_from_G_rgb = make_float3(
+						dspec_dG_rgb.x * dG_dr * dr_dalpha,
+						dspec_dG_rgb.y * dG_dr * dr_dalpha,
+						dspec_dG_rgb.z * dG_dr * dr_dalpha
 					);
 
-					const float dL_dr =
-						dL_dspec_rgb.x * (dspec_dr_from_D_rgb.x + dspec_dr_from_G_rgb.x) +
-						dL_dspec_rgb.y * (dspec_dr_from_D_rgb.y + dspec_dr_from_G_rgb.y) +
-						dL_dspec_rgb.z * (dspec_dr_from_D_rgb.z + dspec_dr_from_G_rgb.z);
+					// dL/d(alpha);  Lout.drough_raw = d(alpha)/d(raw)
+					const float dL_dalpha =
+						dL_dspec_rgb.x * (dspec_dalpha_from_D_rgb.x + dspec_dalpha_from_G_rgb.x) +
+						dL_dspec_rgb.y * (dspec_dalpha_from_D_rgb.y + dspec_dalpha_from_G_rgb.y) +
+						dL_dspec_rgb.z * (dspec_dalpha_from_D_rgb.z + dspec_dalpha_from_G_rgb.z);
 
-					const float dL_draw = dL_dr * Lout.drough_raw;
+					const float dL_draw = dL_dalpha * Lout.drough_raw;
 
 					atomicAdd(&dL_droughness[global_id], dL_draw);
 				}
@@ -2219,14 +2243,21 @@ renderCUDA(
 			#endif
 
 			#if LIGHT_SURFACE_SHADING_MODE
-			dL_dalpha = dL_dalpha_surface;
 
-			#if RENDER_AXUTILITY
-			dL_dalpha += T * dL_dalpha_aux;
-			#endif
+				dL_dalpha = dL_dalpha_surface;
+
+				#if RENDER_AXUTILITY
+				dL_dalpha += T * dL_dalpha_aux;
+				#endif
 
 			#else
-			dL_dalpha *= T;
+
+				dL_dalpha *= T;
+
+				#if RENDER_AXUTILITY
+				dL_dalpha += T * dL_dalpha_aux;
+				#endif
+
 			#endif
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
