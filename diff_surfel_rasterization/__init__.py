@@ -31,6 +31,10 @@ def rasterize_gaussians(
     scales,
     rotations,
     cov3Ds_precomp,
+    gt_luma,
+    gauss_luma_sum,
+    gauss_luma2_sum,
+    gauss_luma_weight_sum,
     raster_settings,
 ):
     return _RasterizeGaussians.apply(
@@ -46,6 +50,10 @@ def rasterize_gaussians(
         scales,
         rotations,
         cov3Ds_precomp,
+        gt_luma,
+        gauss_luma_sum,
+        gauss_luma2_sum,
+        gauss_luma_weight_sum,
         raster_settings,
     )
 
@@ -65,6 +73,10 @@ class _RasterizeGaussians(torch.autograd.Function):
         scales,
         rotations,
         cov3Ds_precomp,
+        gt_luma,
+        gauss_luma_sum,
+        gauss_luma2_sum,
+        gauss_luma_weight_sum,
         raster_settings,
     ):
         # Restructure arguments the way that the C++ lib expects them
@@ -77,6 +89,10 @@ class _RasterizeGaussians(torch.autograd.Function):
             intensity,
             roughness,
             metallic,
+            gt_luma,
+            gauss_luma_sum,
+            gauss_luma2_sum,
+            gauss_luma_weight_sum,
             scales,
             rotations,
             raster_settings.scale_modifier,
@@ -170,6 +186,10 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_intensity,
             grad_roughness,
             grad_metallic,
+            None,  # gt_luma
+            None,  # gauss_luma_sum
+            None,  # gauss_luma2_sum
+            None,  # gauss_luma_weight_sum
             grad_scales,
             grad_rotations,
             grad_cov3Ds_precomp,
@@ -208,7 +228,7 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, ambients, intensity, roughness, metallic, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(self, means3D, means2D, opacities, ambients, intensity, roughness, metallic, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, gt_luma=None, gauss_luma_sum=None, gauss_luma2_sum=None, gauss_luma_weight_sum=None,):
         
         raster_settings = self.raster_settings
 
@@ -230,6 +250,15 @@ class GaussianRasterizer(nn.Module):
         if cov3D_precomp is None:
             cov3D_precomp = torch.Tensor([]).cuda()
 
+        if gt_luma is None:
+            gt_luma = torch.empty(0, device="cuda")
+        if gauss_luma_sum is None:
+            gauss_luma_sum = torch.empty(0, device="cuda")
+        if gauss_luma2_sum is None:
+            gauss_luma2_sum = torch.empty(0, device="cuda")
+        if gauss_luma_weight_sum is None:
+            gauss_luma_weight_sum = torch.empty(0, device="cuda")
+
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
             means3D,
@@ -244,6 +273,10 @@ class GaussianRasterizer(nn.Module):
             scales, 
             rotations,
             cov3D_precomp,
+            gt_luma,
+            gauss_luma_sum,
+            gauss_luma2_sum,
+            gauss_luma_weight_sum,
             raster_settings,
         )
 

@@ -302,6 +302,10 @@ renderCUDA(
 	const float* __restrict__ intensity,
 	const float* __restrict__ roughness,
 	const float* __restrict__ metallic,
+	const float* __restrict__ gt_luma,
+	float* __restrict__ gauss_luma_sum,
+	float* __restrict__ gauss_luma2_sum,
+	float* __restrict__ gauss_luma_weight_sum,
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
@@ -501,6 +505,19 @@ renderCUDA(
 
 			{
 				const int gid_mat = collected_id[j];
+
+				if (gt_luma != nullptr &&
+					gauss_luma_sum != nullptr &&
+					gauss_luma2_sum != nullptr &&
+					gauss_luma_weight_sum != nullptr)
+				{
+					const float y = gt_luma[pix_id];
+					const float ww = w;
+
+					atomicAdd(&gauss_luma_sum[gid_mat], ww * y);
+					atomicAdd(&gauss_luma2_sum[gid_mat], ww * y * y);
+					atomicAdd(&gauss_luma_weight_sum[gid_mat], ww);
+				}
 
 				LightMaterialValues mat = eval_light_material_values(
 					metallic != nullptr ? metallic + gid_mat : nullptr,
@@ -1000,6 +1017,10 @@ void FORWARD::render(
 	const float* intensity,
 	const float* roughness,
 	const float* metallic,
+	const float* gt_luma,
+	float* gauss_luma_sum,
+	float* gauss_luma2_sum,
+	float* gauss_luma_weight_sum,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
@@ -1023,6 +1044,10 @@ void FORWARD::render(
 		intensity,
 		roughness,
 		metallic,
+		gt_luma,
+		gauss_luma_sum,
+		gauss_luma2_sum,
+		gauss_luma_weight_sum,
 		transMats,
 		depths,
 		normal_opacity,

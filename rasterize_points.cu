@@ -46,6 +46,10 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& intensity,
 	const torch::Tensor& roughness,
 	const torch::Tensor& metallic,
+	const torch::Tensor& gt_luma,
+	const torch::Tensor& gauss_luma_sum,
+	const torch::Tensor& gauss_luma2_sum,
+	const torch::Tensor& gauss_luma_weight_sum,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
@@ -79,6 +83,10 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(intensity);
   CHECK_INPUT(roughness);
   CHECK_INPUT(metallic);
+  CHECK_INPUT(gt_luma);
+  CHECK_INPUT(gauss_luma_sum);
+  CHECK_INPUT(gauss_luma2_sum);
+  CHECK_INPUT(gauss_luma_weight_sum);
   CHECK_INPUT(scales);
   CHECK_INPUT(rotations);
   CHECK_INPUT(transMat_precomp);
@@ -112,6 +120,18 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
 	  }
 
+		const float* gt_luma_ptr =
+			gt_luma.numel() > 0 ? gt_luma.contiguous().data_ptr<float>() : nullptr;
+
+		float* gauss_luma_sum_ptr =
+			gauss_luma_sum.numel() > 0 ? gauss_luma_sum.contiguous().data_ptr<float>() : nullptr;
+
+		float* gauss_luma2_sum_ptr =
+			gauss_luma2_sum.numel() > 0 ? gauss_luma2_sum.contiguous().data_ptr<float>() : nullptr;
+
+		float* gauss_luma_weight_sum_ptr =
+			gauss_luma_weight_sum.numel() > 0 ? gauss_luma_weight_sum.contiguous().data_ptr<float>() : nullptr;
+
 	  rendered = CudaRasterizer::Rasterizer::forward(
 		geomFunc,
 		binningFunc,
@@ -127,6 +147,10 @@ RasterizeGaussiansCUDA(
 		intensity.contiguous().data<float>(), 
 		roughness.contiguous().data<float>(),
 		metallic.contiguous().data<float>(),
+		gt_luma_ptr,
+		gauss_luma_sum_ptr,
+		gauss_luma2_sum_ptr,
+		gauss_luma_weight_sum_ptr,
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
