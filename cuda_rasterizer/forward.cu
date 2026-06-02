@@ -354,6 +354,8 @@ renderCUDA(
 #if LIGHT_SURFACE_SHADING_MODE
 
 	float surf_w_sum = 0.0f;
+	float T_surface = 1.0f;
+	bool surf_done = false;
 
 	float3 surf_P_sum = make_float3(0.0f, 0.0f, 0.0f);
 	float3 surf_N_sum = make_float3(0.0f, 0.0f, 0.0f);
@@ -740,6 +742,7 @@ renderCUDA(
 
 		#if LIGHT_SURFACE_SHADING_MODE
 
+			if (!surf_done)
 			{
 				const int gid_surf = collected_id[j];
 
@@ -751,6 +754,46 @@ renderCUDA(
 
 				float3 n_basis = faceforward_basis_normal(bu_cam, bv_cam, point_cam);
 
+				float3 n_stored = make_float3(normal[0], normal[1], normal[2]);
+				n_stored = normalize_or_default(n_stored, n_basis);
+
+				// Faceforward stored normal too.
+				float3 view_ray_ff = normalize_or_default(point_cam, make_float3(0.0f, 0.0f, 1.0f));
+				float3 V_ff = make_float3(-view_ray_ff.x, -view_ray_ff.y, -view_ray_ff.z);
+
+				float ndotv_stored =
+					n_stored.x * V_ff.x +
+					n_stored.y * V_ff.y +
+					n_stored.z * V_ff.z;
+
+				if (ndotv_stored < 0.0f)
+				{
+					n_stored.x = -n_stored.x;
+					n_stored.y = -n_stored.y;
+					n_stored.z = -n_stored.z;
+				}
+
+				// keep basis normal mostly, but stabilize with stored/original normal
+				const float normal_blend = 0.75f;
+
+				float3 n_mix = make_float3(
+					normal_blend * n_basis.x + (1.0f - normal_blend) * n_stored.x,
+					normal_blend * n_basis.y + (1.0f - normal_blend) * n_stored.y,
+					normal_blend * n_basis.z + (1.0f - normal_blend) * n_stored.z
+				);
+
+				n_mix = normalize_or_default(n_mix, n_basis);
+
+				float ndiff =
+					n_basis.x * n_stored.x +
+					n_basis.y * n_stored.y +
+					n_basis.z * n_stored.z;
+
+				if (ndiff < 0.5f)
+				{
+					n_mix = n_stored;
+				}
+
 				LightMaterialValues mat = eval_light_material_values(
 					metallic != nullptr ? metallic + gid_surf : nullptr,
 					roughness != nullptr ? roughness + gid_surf : nullptr
@@ -761,13 +804,13 @@ renderCUDA(
 
 				surf_w_sum += w;
 
-				surf_P_sum.x += w * point_cam.x;
-				surf_P_sum.y += w * point_cam.y;
-				surf_P_sum.z += w * point_cam.z;
+				surf_P_sum.x += w * center_cam.x;
+				surf_P_sum.y += w * center_cam.y;
+				surf_P_sum.z += w * center_cam.z;
 
-				surf_N_sum.x += w * n_basis.x;
-				surf_N_sum.y += w * n_basis.y;
-				surf_N_sum.z += w * n_basis.z;
+				surf_N_sum.x += w * n_mix.x;
+				surf_N_sum.y += w * n_mix.y;
+				surf_N_sum.z += w * n_mix.z;
 
 				surf_base_sum.x += w * base_rgb.x;
 				surf_base_sum.y += w * base_rgb.y;
@@ -776,9 +819,14 @@ renderCUDA(
 				surf_rough_sum += w * r_val;
 				surf_metal_sum += w * m_val;
 				
-				// depth may be invalid in fallback mode.
-				// Use point_cam.z as the safe fallback depth.
-				surf_depth_sum += w * (depth_valid ? depth : point_cam.z);
+				surf_depth_sum += w * center_cam.z;
+
+				if (!surf_done)
+				{
+					T_surface *= (1.0f - alpha);
+					if (T_surface < 0.0001f)
+						surf_done = true;
+				}
 			}
 
 		#else
@@ -833,14 +881,23 @@ renderCUDA(
 				surf_P_sum.z * invW
 			);
 
-			float3 surf_N = normalize_or_default(
-				make_float3(
-					surf_N_sum.x * invW,
-					surf_N_sum.y * invW,
-					surf_N_sum.z * invW
-				),
-				make_float3(0.0f, 0.0f, 1.0f)
+			float3 surf_N_raw = make_float3(
+				surf_N_sum.x * invW,
+				surf_N_sum.y * invW,
+				surf_N_sum.z * invW
 			);
+			float3 surf_view_ray = normalize_or_default(surf_P, make_float3(0.0f, 0.0f, 1.0f));
+			float3 surf_V = make_float3(-surf_view_ray.x, -surf_view_ray.y, -surf_view_ray.z);
+			float3 surf_N = normalize_or_default(surf_N_raw, make_float3(0.0f, 0.0f, 1.0f));
+			{
+				float ndotv_check = surf_N.x * surf_V.x + surf_N.y * surf_V.y + surf_N.z * surf_V.z;
+				if (ndotv_check < 0.0f)
+				{
+					surf_N.x = -surf_N.x;
+					surf_N.y = -surf_N.y;
+					surf_N.z = -surf_N.z;
+				}
+			}
 
 			float3 surf_base = make_float3(
 				surf_base_sum.x * invW,
@@ -868,7 +925,7 @@ renderCUDA(
 					&surf_P
 				);
 
-			const float surface_alpha = 1.0f - T;
+			const float surface_alpha = 1.0f - T_surface;
 
 			C[0] = surface_alpha * (
 				surf_base.x * Lsurf.diffuse_mul_rgb.x +

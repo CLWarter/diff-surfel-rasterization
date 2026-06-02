@@ -1031,7 +1031,7 @@ LightingOut eval_lighting(
     float3 F_rgb = o.F0_rgb;
     float3 spec_brdf_rgb = make_float3(0.0f, 0.0f, 0.0f);
 
-    if (o.ndotl > 0.0f && o.ndotv > 0.0f)
+    if (o.ndotl > 0.0f && o.ndotv >= 0.0f)
     {
         float nv = fmaxf(o.ndotv, LIGHT_GGX_NV_EPS);
         float nl = fmaxf(o.ndotl, LIGHT_GGX_NL_EPS);

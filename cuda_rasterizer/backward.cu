@@ -768,22 +768,44 @@ renderCUDA(
 				collected_colors[2 * BLOCK_SIZE + jj]
 			);
 
-			float3 n_basis = cross(bu_cam, bv_cam);
-			n_basis = normalize_or_default(n_basis, make_float3(0.0f, 0.0f, 1.0f));
+			float3 n_basis = faceforward_basis_normal(bu_cam, bv_cam, point_cam);
 
-			float3 view_ray = normalize_or_default(point_cam, make_float3(0.0f, 0.0f, 1.0f));
-			float3 V = make_float3(-view_ray.x, -view_ray.y, -view_ray.z);
+			float3 n_stored = make_float3(nor_o.x, nor_o.y, nor_o.z);
+			n_stored = normalize_or_default(n_stored, n_basis);
 
-			float ndotv_basis =
-				n_basis.x * V.x +
-				n_basis.y * V.y +
-				n_basis.z * V.z;
+			float3 view_ray_ff = normalize_or_default(point_cam, make_float3(0.0f, 0.0f, 1.0f));
+			float3 V_ff = make_float3(-view_ray_ff.x, -view_ray_ff.y, -view_ray_ff.z);
 
-			if (ndotv_basis < 0.0f)
+			float ndotv_stored =
+				n_stored.x * V_ff.x +
+				n_stored.y * V_ff.y +
+				n_stored.z * V_ff.z;
+
+			if (ndotv_stored < 0.0f)
 			{
-				n_basis.x = -n_basis.x;
-				n_basis.y = -n_basis.y;
-				n_basis.z = -n_basis.z;
+				n_stored.x = -n_stored.x;
+				n_stored.y = -n_stored.y;
+				n_stored.z = -n_stored.z;
+			}
+
+			const float normal_blend = 0.75f;
+
+			float3 n_mix = make_float3(
+				normal_blend * n_basis.x + (1.0f - normal_blend) * n_stored.x,
+				normal_blend * n_basis.y + (1.0f - normal_blend) * n_stored.y,
+				normal_blend * n_basis.z + (1.0f - normal_blend) * n_stored.z
+			);
+
+			n_mix = normalize_or_default(n_mix, n_basis);
+
+			float ndiff =
+				n_basis.x * n_stored.x +
+				n_basis.y * n_stored.y +
+				n_basis.z * n_stored.z;
+
+			if (ndiff < 0.5f)
+			{
+				n_mix = n_stored;
 			}
 
 			float dmetal_dummy = 0.0f;
@@ -811,13 +833,13 @@ renderCUDA(
 
 			surf_w_sum += w;
 
-			surf_P_sum.x += w * point_cam.x;
-			surf_P_sum.y += w * point_cam.y;
-			surf_P_sum.z += w * point_cam.z;
+			surf_P_sum.x += w * center_cam.x;
+			surf_P_sum.y += w * center_cam.y;
+			surf_P_sum.z += w * center_cam.z;
 
-			surf_N_sum.x += w * n_basis.x;
-			surf_N_sum.y += w * n_basis.y;
-			surf_N_sum.z += w * n_basis.z;
+			surf_N_sum.x += w * n_mix.x;
+			surf_N_sum.y += w * n_mix.y;
+			surf_N_sum.z += w * n_mix.z;
 
 			surf_base_sum.x += w * base_rgb.x;
 			surf_base_sum.y += w * base_rgb.y;
@@ -825,7 +847,7 @@ renderCUDA(
 
 			surf_rough_sum += w * r_val;
 			surf_metal_sum += w * m_val;
-			surf_depth_sum += w * (depth_valid ? depth : point_cam.z);
+			surf_depth_sum += w * center_cam.z;
 
 			T_surface *= (1.0f - alpha);
 			if (T_surface < 0.0001f)
@@ -837,6 +859,7 @@ renderCUDA(
 
 	float3 surf_P = make_float3(0.0f, 0.0f, 0.0f);
 	float3 surf_N = make_float3(0.0f, 0.0f, 1.0f);
+	float3 surf_N_raw = make_float3(0.0f, 0.0f, 1.0f);
 	float3 surf_base = make_float3(0.0f, 0.0f, 0.0f);
 
 	float surf_rough = LIGHT_GGX_ROUGHNESS;
@@ -853,14 +876,23 @@ renderCUDA(
 			surf_P_sum.z * invW
 		);
 
-		surf_N = normalize_or_default(
-			make_float3(
-				surf_N_sum.x * invW,
-				surf_N_sum.y * invW,
-				surf_N_sum.z * invW
-			),
-			make_float3(0.0f, 0.0f, 1.0f)
+		surf_N_raw = make_float3(
+			surf_N_sum.x * invW,
+			surf_N_sum.y * invW,
+			surf_N_sum.z * invW
 		);
+		float3 surf_view_ray = normalize_or_default(surf_P, make_float3(0.0f, 0.0f, 1.0f));
+		float3 surf_V = make_float3(-surf_view_ray.x, -surf_view_ray.y, -surf_view_ray.z);
+		surf_N = normalize_or_default(surf_N_raw, make_float3(0.0f, 0.0f, 1.0f));
+		{
+			float ndotv_check = surf_N.x * surf_V.x + surf_N.y * surf_V.y + surf_N.z * surf_V.z;
+			if (ndotv_check < 0.0f)
+			{
+				surf_N.x = -surf_N.x;
+				surf_N.y = -surf_N.y;
+				surf_N.z = -surf_N.z;
+			}
+		}
 
 		surf_base = make_float3(
 			surf_base_sum.x * invW,
@@ -950,7 +982,6 @@ renderCUDA(
 			const float nv = fmaxf(Lsurf.ndotv, LIGHT_GGX_NV_EPS);
 			const float nl = fmaxf(Lsurf.ndotl, LIGHT_GGX_NL_EPS);
 			const float invden = 1.0f / fmaxf(4.0f * nv * nl, LIGHT_GGX_DENOM_EPS);
-			const float spec_scale = Lsurf.lambert * Lsurf.spot * Lsurf.Li;
 
 			// D-path: dD/d(alpha) = dD_da2 * 2*alpha,  alpha = r^2
 			const float alpha = r * r;
@@ -976,8 +1007,10 @@ renderCUDA(
 			const float dCommon_dalpha = dCommon_dalpha_D + dCommon_dalpha_G;
 
 			// dL_dsurf_rough = dL/d(alpha); multiplied by d(alpha)/d(raw) = drough_draw
+			const float spec_scale = 4;
+			const float brdf_scale = Lsurf.lambert * Lsurf.spot * Lsurf.Li;
 			dL_dsurf_rough =
-				surface_alpha * spec_scale * (
+				surface_alpha * spec_scale * brdf_scale * (
 					dL_dpixel[0] * Lsurf.fresnel_rgb.x * dCommon_dalpha +
 					dL_dpixel[1] * Lsurf.fresnel_rgb.y * dCommon_dalpha +
 					dL_dpixel[2] * Lsurf.fresnel_rgb.z * dCommon_dalpha
@@ -1138,7 +1171,6 @@ renderCUDA(
 			dL_dsurf_P.y += dL_ddist2 * 2.0f * LP.y;
 			dL_dsurf_P.z += dL_ddist2 * 2.0f * LP.z;
 
-			dL_dsurf_depth += dL_dsurf_P.z;
 		}
 		// ---------- Surface normal gradient through Lambert + GGX angular terms ----------
 		{
@@ -1281,7 +1313,7 @@ renderCUDA(
 
 	if (surf_w_sum > 1e-8f)
 	{
-		dL_dsurf_N_raw = apply_norm_jacobian(surf_N, dL_dsurf_N);
+		dL_dsurf_N_raw = apply_norm_jacobian(surf_N_raw, dL_dsurf_N);
 	}
 
 	float future_weight_grad = 0.0f;
@@ -1446,6 +1478,47 @@ renderCUDA(
 		
 		float3 n_basis = faceforward_basis_normal(bu_cam, bv_cam, point_cam);
 
+		float3 n_stored = make_float3(normal[0], normal[1], normal[2]);
+		n_stored = normalize_or_default(n_stored, n_basis);
+
+		// Faceforward stored normal too.
+		float3 view_ray_ff = normalize_or_default(point_cam, make_float3(0.0f, 0.0f, 1.0f));
+		float3 V_ff = make_float3(-view_ray_ff.x, -view_ray_ff.y, -view_ray_ff.z);
+
+		float ndotv_stored =
+			n_stored.x * V_ff.x +
+			n_stored.y * V_ff.y +
+			n_stored.z * V_ff.z;
+
+		if (ndotv_stored < 0.0f)
+		{
+			n_stored.x = -n_stored.x;
+			n_stored.y = -n_stored.y;
+			n_stored.z = -n_stored.z;
+		}
+
+		const float normal_blend = 0.75f;
+
+		float3 n_mix = make_float3(
+			normal_blend * n_basis.x + (1.0f - normal_blend) * n_stored.x,
+			normal_blend * n_basis.y + (1.0f - normal_blend) * n_stored.y,
+			normal_blend * n_basis.z + (1.0f - normal_blend) * n_stored.z
+		);
+
+		n_mix = normalize_or_default(n_mix, n_basis);
+
+		float ndiff =
+			n_basis.x * n_stored.x +
+			n_basis.y * n_stored.y +
+			n_basis.z * n_stored.z;
+
+		const bool use_stored_normal = (ndiff < 0.5f);
+
+		if (use_stored_normal)
+		{
+			n_mix = n_stored;
+		}
+
 		 LightMaterialValues mat = eval_light_material_values(
 			metallic != nullptr ? metallic + gid : nullptr,
 			roughness != nullptr ? roughness + gid : nullptr
@@ -1480,28 +1553,44 @@ renderCUDA(
 		dL_dw += dL_dsurf_P.y * (point_cam.y - surf_P.y) * invW;
 		dL_dw += dL_dsurf_P.z * (point_cam.z - surf_P.z) * invW;
 
-		dL_dw += dL_dsurf_N_raw.x * (n_basis.x - surf_N.x) * invW;
-		dL_dw += dL_dsurf_N_raw.y * (n_basis.y - surf_N.y) * invW;
-		dL_dw += dL_dsurf_N_raw.z * (n_basis.z - surf_N.z) * invW;
-
-		dL_dw += dL_dsurf_depth * (safe_depth - surf_depth) * invW;
+		dL_dw += dL_dsurf_N_raw.x * (n_mix.x - surf_N_raw.x) * invW;
+		dL_dw += dL_dsurf_N_raw.y * (n_mix.y - surf_N_raw.y) * invW;
+		dL_dw += dL_dsurf_N_raw.z * (n_mix.z - surf_N_raw.z) * invW;
 
 		const float coeff_norm = w * invW;
 
-		float3 dL_dn_basis = make_float3(
+		float3 dL_dn_mix = make_float3(
 			coeff_norm * dL_dsurf_N_raw.x,
 			coeff_norm * dL_dsurf_N_raw.y,
 			coeff_norm * dL_dsurf_N_raw.z
 		);
 
-		float3 c_basis = cross(bu_cam, bv_cam);
-		float3 c_basis_norm = normalize_or_default(c_basis, make_float3(0.0f, 0.0f, 1.0f));
+		float3 dL_dbu = make_float3(0.0f, 0.0f, 0.0f);
+		float3 dL_dbv = make_float3(0.0f, 0.0f, 0.0f);
 
-		float3 dL_dc_basis = apply_norm_jacobian(c_basis, dL_dn_basis);
+		if (!use_stored_normal)
+		{
+			// n_mix = normalize(normal_blend * n_basis + (1-normal_blend) * n_stored)
+			float3 n_pre = make_float3(
+				normal_blend * n_basis.x + (1.0f - normal_blend) * n_stored.x,
+				normal_blend * n_basis.y + (1.0f - normal_blend) * n_stored.y,
+				normal_blend * n_basis.z + (1.0f - normal_blend) * n_stored.z
+			);
 
-		// c = bu × bv
-		float3 dL_dbu = cross(bv_cam, dL_dc_basis);
-		float3 dL_dbv = cross(dL_dc_basis, bu_cam);
+			float3 dL_dn_pre = apply_norm_jacobian(n_pre, dL_dn_mix);
+
+			float3 dL_dn_basis = make_float3(
+				normal_blend * dL_dn_pre.x,
+				normal_blend * dL_dn_pre.y,
+				normal_blend * dL_dn_pre.z
+			);
+
+			float3 c_basis = cross(bu_cam, bv_cam);
+			float3 dL_dc_basis = apply_norm_jacobian(c_basis, dL_dn_basis);
+
+			dL_dbu = cross(bv_cam, dL_dc_basis);
+			dL_dbv = cross(dL_dc_basis, bu_cam);
+		}
 
 		const float coeff_geom = w * invW;
 
@@ -1516,8 +1605,6 @@ renderCUDA(
 			dL_dsurf_P.y * bv_cam.y +
 			dL_dsurf_P.z * bv_cam.z
 		);
-
-		dL_dz += coeff_geom * dL_dsurf_depth;
 
 		atomicAdd(&dL_dbasis_u_cam[global_id].x, dL_dbu.x);
 		atomicAdd(&dL_dbasis_u_cam[global_id].y, dL_dbu.y);
@@ -1534,7 +1621,7 @@ renderCUDA(
 		future_weight_grad += dL_dw * w;
 
 		dL_dalpha_surface +=
-			dL_dsurface_alpha * T_final / one_minus_alpha;
+			dL_dsurface_alpha * T_surface / one_minus_alpha;
     }
 }
 #elif LIGHT_ENABLE_BWD && (LIGHT_USE_LAMBERT || LIGHT_USE_PHONG)
